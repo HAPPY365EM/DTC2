@@ -15,8 +15,8 @@ def cal_dice(prediction, label, num=2):
     for i in range(1, num):
         prediction_tmp = (prediction == i)
         label_tmp = (label == i)
-        prediction_tmp = prediction_tmp.astype(np.float)
-        label_tmp = label_tmp.astype(np.float)
+        prediction_tmp = prediction_tmp.astype(np.float64)
+        label_tmp = label_tmp.astype(np.float64)
 
         dice = 2 * np.sum(prediction_tmp * label_tmp) / (np.sum(prediction_tmp) + np.sum(label_tmp))
         total_dice[i - 1] += dice
