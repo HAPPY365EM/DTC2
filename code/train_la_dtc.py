@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, MSELoss
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
-from scipy.ndimage import morphology as morph
+from scipy.ndimage import binary_dilation, binary_erosion, generate_binary_structure
 
 from networks.vnet_sdf import VNet
 from dataloaders import utils
@@ -102,38 +102,30 @@ patch_size = (112, 112, 80)
 
 
 def get_current_consistency_weight(epoch):
-    """原始预热函数，用于边界损失权重或全局一致性系数（可选）"""
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
 def generate_boundary_gt(label_batch):
     """
-    从分割标签生成边界真值（形态学梯度）
     label_batch: torch.Tensor, shape (B, D, H, W) 或 (B, 1, D, H, W), 值为0/1
-    return: boundary map, shape (B, D, H, W) 或 (B, 1, D, H, W), 值为0/1
+    return: boundary map, shape (B, 1, D, H, W), 值为0/1
     """
-    # 确保输入是 4D 或 5D，统一转为 (B, D, H, W)
     if label_batch.dim() == 5:
         label_batch = label_batch.squeeze(1)
     device = label_batch.device
     label_np = label_batch.cpu().numpy().astype(np.uint8)
     boundary_np = np.zeros_like(label_np)
-    struct = morph.generate_binary_structure(3, 1)  # 3x3x3 结构元素
+    struct = generate_binary_structure(3, 1)  # 3x3x3
     for i in range(label_np.shape[0]):
-        dilated = morph.binary_dilation(label_np[i], struct)
-        eroded = morph.binary_erosion(label_np[i], struct)
+        dilated = binary_dilation(label_np[i], struct)
+        eroded = binary_erosion(label_np[i], struct)
         boundary_np[i] = (dilated.astype(np.uint8) - eroded.astype(np.uint8))
     boundary_tensor = torch.from_numpy(boundary_np).float().to(device)
-    # 增加通道维度 (B, 1, D, H, W)
     return boundary_tensor.unsqueeze(1)
 
 
 def dice_loss_boundary(pred, target, smooth=1e-5):
-    """
-    适用于稀疏边界图的 Dice 损失
-    pred: sigmoid 输出，shape (B, 1, D, H, W)
-    target: binary, shape (B, 1, D, H, W)
-    """
+    """适用于稀疏边界图的 Dice 损失"""
     pred_flat = pred.view(pred.size(0), -1)
     target_flat = target.view(target.size(0), -1)
     intersection = (pred_flat * target_flat).sum(dim=1)
@@ -143,7 +135,6 @@ def dice_loss_boundary(pred, target, smooth=1e-5):
 
 
 if __name__ == "__main__":
-    # 创建日志和模型保存目录
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     if os.path.exists(snapshot_path + '/code'):
@@ -157,7 +148,6 @@ if __name__ == "__main__":
     logging.info(str(args))
 
     def create_model(ema=False):
-        # Network definition (输出三个分支: 水平集, 分割logits, 边界logits)
         net = VNet(n_channels=1, n_classes=num_classes-1,
                    normalization='batchnorm', has_dropout=True)
         model = net.cuda()
@@ -217,53 +207,43 @@ if __name__ == "__main__":
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
-            # 前向传播，得到三个输出
             outputs_tanh, outputs, outputs_boundary = model(volume_batch)
-            outputs_soft = torch.sigmoid(outputs)  # 分割概率图 (B,1,D,H,W)
-            dis_to_mask = torch.sigmoid(-1500 * outputs_tanh)  # 水平集转分割概率 (B,1,D,H,W)
+            outputs_soft = torch.sigmoid(outputs)
+            dis_to_mask = torch.sigmoid(-1500 * outputs_tanh)
 
-            # ========== 有标签数据的监督损失 ==========
-            # 1. 分割 Dice 损失
+            # 有标签监督损失
             loss_seg_dice = losses.dice_loss(
                 outputs_soft[:labeled_bs, 0, :, :, :], label_batch[:labeled_bs] == 1)
 
-            # 2. 水平集回归损失 (SDF)
             with torch.no_grad():
                 gt_dis = compute_sdf(label_batch[:labeled_bs].cpu().numpy(),
                                      outputs[:labeled_bs, 0, ...].shape)
                 gt_dis = torch.from_numpy(gt_dis).float().cuda()
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
 
-            # 3. 边界损失 (仅在有标签数据上)
             with torch.no_grad():
-                boundary_gt = generate_boundary_gt(label_batch[:labeled_bs])  # (B,1,D,H,W)
+                boundary_gt = generate_boundary_gt(label_batch[:labeled_bs])
             loss_boundary = dice_loss_boundary(torch.sigmoid(outputs_boundary[:labeled_bs]), boundary_gt)
 
             supervised_loss = loss_seg_dice + args.beta * loss_sdf + args.lambda_boundary * loss_boundary
 
-            # ========== 自适应双任务一致性损失 (同时用于有标签和无标签) ==========
-            # 像素级差异图: |分割概率 - 水平集转换概率|
-            diff_map = torch.abs(outputs_soft - dis_to_mask)  # (B,1,D,H,W)
-            # 自适应权重 W(x) = exp(-gamma * diff)
+            # 自适应一致性损失
+            diff_map = torch.abs(outputs_soft - dis_to_mask)
             gamma = args.gamma_uncertainty
-            W = torch.exp(-gamma * diff_map)  # (B,1,D,H,W)
+            W = torch.exp(-gamma * diff_map)
 
-            # 边界注意力图: 从边界预测头生成，用于空间加权
             if args.use_boundary_attn:
                 with torch.no_grad():
-                    boundary_attn = torch.sigmoid(outputs_boundary)  # (B,1,D,H,W)
+                    boundary_attn = torch.sigmoid(outputs_boundary)
                 alpha = args.alpha_boundary
                 spatial_weight = alpha * boundary_attn + (1 - alpha)
             else:
                 spatial_weight = torch.ones_like(W)
 
-            # 加权 MSE 一致性损失
             weighted_mse = (W * spatial_weight) * ((outputs_soft - dis_to_mask) ** 2)
             consistency_loss = weighted_mse.mean()
 
-            # 全局一致性系数：可选预热或固定为1.0，这里使用预热但作用在整体上
             if args.use_adaptive_weight:
-                # 自适应权重已经内部调节，全局系数可以固定为1.0或也用预热
                 global_cons_weight = 1.0
             else:
                 global_cons_weight = get_current_consistency_weight(iter_num // 150)
@@ -274,16 +254,12 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
 
-            # 计算有标签数据的 Dice 用于监控
             with torch.no_grad():
-                pred_label = torch.argmax(outputs_soft[:labeled_bs], dim=1)  # 因为输出是单通道，argmax 得到0/1
-                # 实际 outputs_soft 是 (B,1,D,H,W)，因此直接 threshold 0.5
                 pred_mask = (outputs_soft[:labeled_bs, 0] > 0.5).float()
                 dc = metrics.dice(pred_mask, label_batch[:labeled_bs].float())
 
-            iter_num = iter_num + 1
+            iter_num += 1
 
-            # TensorBoard 记录
             writer.add_scalar('lr', lr_, iter_num)
             writer.add_scalar('loss/loss', loss, iter_num)
             writer.add_scalar('loss/loss_seg_dice', loss_seg_dice, iter_num)
@@ -299,37 +275,52 @@ if __name__ == "__main__":
                 (iter_num, loss.item(), loss_seg_dice.item(), loss_sdf.item(),
                  loss_boundary.item(), consistency_loss.item(), dc))
 
-            # 可视化（每50轮）
+            # ========== 可视化（修正维度错误） ==========
             if iter_num % 50 == 0:
-                image = volume_batch[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=True)
+                # 原始图像
+                img_slice = volume_batch[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                grid_image = make_grid(img_slice, 5, normalize=True)
                 writer.add_image('train/Image', grid_image, iter_num)
 
-                image = outputs_soft[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=False)
+                # 分割预测
+                pred_slice = outputs_soft[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                grid_image = make_grid(pred_slice, 5, normalize=False)
                 writer.add_image('train/Predicted_label', grid_image, iter_num)
 
-                image = dis_to_mask[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=False)
+                # 水平集转换图
+                dis_slice = dis_to_mask[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                grid_image = make_grid(dis_slice, 5, normalize=False)
                 writer.add_image('train/Dis2Mask', grid_image, iter_num)
 
-                image = outputs_tanh[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=False)
+                # 水平集距离图
+                tanh_slice = outputs_tanh[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                grid_image = make_grid(tanh_slice, 5, normalize=False)
                 writer.add_image('train/DistMap', grid_image, iter_num)
 
-                image = label_batch[0, :, :, 20:61:10].unsqueeze(0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=False)
+                # 真实标签
+                gt_slice = label_batch[0, :, :, 20:61:10].unsqueeze(0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                grid_image = make_grid(gt_slice, 5, normalize=False)
                 writer.add_image('train/Groundtruth_label', grid_image, iter_num)
 
-                image = gt_dis[0, :, :, 20:61:10].unsqueeze(0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=False)
+                # 真实 SDF
+                gt_dis_slice = gt_dis[0, :, :, 20:61:10].unsqueeze(0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                grid_image = make_grid(gt_dis_slice, 5, normalize=False)
                 writer.add_image('train/Groundtruth_DistMap', grid_image, iter_num)
 
-                # 边界预测可视化
-                boundary_pred = torch.sigmoid(outputs_boundary[0, 0, ...]).unsqueeze(0).unsqueeze(0)
-                image = boundary_pred[:, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=False)
+                # 边界预测（修正维度）
+                # outputs_boundary 形状 (B,1,D,H,W)，取第一个样本第一个通道
+                boundary_map = torch.sigmoid(outputs_boundary[0, 0, ...])  # (D,H,W)
+                # 切片并添加 batch 和 channel 维度
+                boundary_slice = boundary_map[20:61:10, :, :].unsqueeze(0).unsqueeze(0)  # (1,1, H_slice, W_slice)
+                # 重复为3通道用于显示
+                boundary_slice = boundary_slice.repeat(1, 3, 1, 1)
+                grid_image = make_grid(boundary_slice, 5, normalize=False)
                 writer.add_image('train/Boundary_pred', grid_image, iter_num)
+
+                # 可选：显示自适应权重图
+                weight_slice = W[0, 0, :, :, 20:61:10].permute(2, 0, 1).unsqueeze(0).repeat(1, 3, 1, 1)
+                grid_image = make_grid(weight_slice, 5, normalize=False)
+                writer.add_image('train/Adaptive_weight', grid_image, iter_num)
 
             # 学习率衰减
             if iter_num % 2500 == 0:
@@ -351,7 +342,6 @@ if __name__ == "__main__":
             break
 
     writer.close()
-    # 保存最终模型
     save_mode_path = os.path.join(snapshot_path, 'best_model.pth')
     torch.save(model.state_dict(), save_mode_path)
     logging.info("save final model to {}".format(save_mode_path))
