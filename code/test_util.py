@@ -115,7 +115,7 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
                 cnt[xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] += 1
 
     score_map = score_map / np.expand_dims(cnt, axis=0)
-    label_map = (score_map[0] > 0.5).astype(np.int)
+    label_map = (score_map[0] > 0.5).astype(np.int64)
 
     if add_pad:
         label_map = label_map[wl_pad:wl_pad+w,
@@ -130,8 +130,8 @@ def cal_dice(prediction, label, num=2):
     for i in range(1, num):
         prediction_tmp = (prediction == i)
         label_tmp = (label == i)
-        prediction_tmp = prediction_tmp.astype(np.float)
-        label_tmp = label_tmp.astype(np.float)
+        prediction_tmp = prediction_tmp.astype(np.float64)
+        label_tmp = label_tmp.astype(np.float64)
 
         dice = 2 * np.sum(prediction_tmp * label_tmp) / \
             (np.sum(prediction_tmp) + np.sum(label_tmp))
