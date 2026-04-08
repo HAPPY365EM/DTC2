@@ -135,7 +135,7 @@ def compute_sdf(img_gt, out_shape):
     normalized_sdf = np.zeros(out_shape)
 
     for b in range(out_shape[0]): # batch size
-        posmask = img_gt[b].astype(np.bool)
+        posmask = img_gt[b].astype(bool)
         if posmask.any():
             negmask = ~posmask
             posdis = distance(posmask)
