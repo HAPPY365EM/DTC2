@@ -21,7 +21,6 @@ def test_all_case(net, image_list, num_classes, patch_size=(112, 112, 80), strid
     loader = tqdm(image_list) if not metric_detail else image_list
     ith = 0
     for image_path in loader:
-        # id = image_path.split('/')[-2]
         h5f = h5py.File(image_path, 'r')
         image = h5f['image'][:]
         label = h5f['label'][:]
@@ -88,7 +87,6 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
     sx = math.ceil((ww - patch_size[0]) / stride_xy) + 1
     sy = math.ceil((hh - patch_size[1]) / stride_xy) + 1
     sz = math.ceil((dd - patch_size[2]) / stride_z) + 1
-    # print("{}, {}, {}".format(sx, sy, sz))
     score_map = np.zeros((num_classes, ) + image.shape).astype(np.float32)
     cnt = np.zeros(image.shape).astype(np.float32)
 
@@ -105,20 +103,18 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
                 test_patch = torch.from_numpy(test_patch).cuda()
 
                 with torch.no_grad():
-                    y1_tanh, y1 = net(test_patch)
-                    # ensemble
+                    # 网络现在输出三个值: 水平集, 分割logits, 边界logits
+                    y1_tanh, y1, _ = net(test_patch)
                     y = torch.sigmoid(y1)
-                    dis_to_mask = torch.sigmoid(-1500*y1_tanh)
+                    # 下面的 dis_to_mask 仅用于可视化或可选的融合，这里不参与最终分割
+                    # dis_to_mask = torch.sigmoid(-1500*y1_tanh)
 
                 y = y.cpu().data.numpy()
-                dis2mask = dis_to_mask.cpu().data.numpy()
-                y = y[0, :, :, :, :]
-                dis2mask = dis2mask[0, :, :, :, :]
-                score_map[:, xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] \
-                    = score_map[:, xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] + y
-                cnt[xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] \
-                    = cnt[xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] + 1
-    score_map = score_map/np.expand_dims(cnt, axis=0)
+                y = y[0, 0, :, :, :]  # 取单通道概率图
+                score_map[0, xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] += y
+                cnt[xs:xs+patch_size[0], ys:ys+patch_size[1], zs:zs+patch_size[2]] += 1
+
+    score_map = score_map / np.expand_dims(cnt, axis=0)
     label_map = (score_map[0] > 0.5).astype(np.int)
 
     if add_pad:

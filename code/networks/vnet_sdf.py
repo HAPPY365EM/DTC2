@@ -180,6 +180,7 @@ class VNet(nn.Module):
         self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
         self.out_conv2 = nn.Conv3d(n_filters, n_classes, 1, padding=0)
+        self.out_boundary = nn.Conv3d(n_filters, 1, 1, padding=0)
         self.tanh = nn.Tanh()
 
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
@@ -235,18 +236,18 @@ class VNet(nn.Module):
         out = self.out_conv(x9)
         out_tanh = self.tanh(out)
         out_seg = self.out_conv2(x9)
-        return out_tanh, out_seg
-
+        out_boundary = self.out_boundary(x9)
+        return out_tanh, out_seg, out_boundary
 
     def forward(self, input, turnoff_drop=False):
         if turnoff_drop:
             has_dropout = self.has_dropout
             self.has_dropout = False
         features = self.encoder(input)
-        out_tanh, out_seg = self.decoder(features)
+        out_tanh, out_seg, out_boundary = self.decoder(features)
         if turnoff_drop:
             self.has_dropout = has_dropout
-        return out_tanh, out_seg
+        return out_tanh, out_seg, out_boundary
 
     # def __init_weight(self):
     #     for m in self.modules():

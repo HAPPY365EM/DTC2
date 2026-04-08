@@ -164,3 +164,17 @@ def entropy_map(p):
     ent_map = -1*torch.sum(p * torch.log(p + 1e-6), dim=1,
                            keepdim=True)
     return ent_map
+
+def dice_loss_boundary(pred, target, smooth=1e-5):
+    """
+    pred: sigmoid output (B, D, H, W) or (B, 1, D, H, W)
+    target: binary (B, D, H, W) or (B, 1, D, H, W)
+    """
+    if pred.dim() != target.dim():
+        target = target.unsqueeze(1)
+    pred_flat = pred.view(pred.size(0), -1)
+    target_flat = target.view(target.size(0), -1)
+    intersection = (pred_flat * target_flat).sum(dim=1)
+    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
