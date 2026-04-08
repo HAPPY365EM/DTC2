@@ -16,7 +16,7 @@ def compute_dtm(img_gt, out_shape, normalize=False, fg=False):
     fg_dtm = np.zeros(out_shape)
 
     for b in range(out_shape[0]): # batch size
-        posmask = img_gt[b].astype(np.bool)
+        posmask = img_gt[b].astype(bool)
         if not fg:
             if posmask.any():
                 negmask = 1 - posmask
