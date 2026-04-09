@@ -170,6 +170,68 @@ def compute_boundary_gt(label_batch_np):
 # NEW — Improvement 2: Adaptive DTC loss with boundary spatial emphasis
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# NEW — Improvement 3: Confidence-gated pseudo-label Dice loss
+# ---------------------------------------------------------------------------
+
+def pseudo_label_dice_loss(outputs_soft_unlabeled, dis_to_mask_unlabeled,
+                           W_unlabeled, tau=0.8):
+    """
+    Confidence-gated pseudo-label Dice loss for unlabeled data.
+
+    Motivation: the adaptive DTC loss and boundary head improve surface metrics
+    but contribute little to volumetric Dice, which is driven by interior region
+    accuracy. This loss provides direct Dice-optimisation signal on unlabeled
+    data using only the voxels where both tasks already agree strongly.
+
+    Algorithm:
+      1. Build a reliability mask M(x) = 1 where W(x) > tau.
+         W is the task-agreement weight already computed by adaptive_dtc_loss.
+         High W → both tasks agree → pseudo-label is trustworthy.
+      2. Construct a soft pseudo-label ŷ(x) by averaging the two task predictions
+         at reliable voxels. Averaging reduces single-task bias.
+      3. Apply Dice loss between the segmentation prediction and ŷ, restricted
+         to reliable voxels only via element-wise masking.
+      4. If no voxel passes the threshold (degenerate early-training case),
+         return zero loss gracefully.
+
+    Args:
+        outputs_soft_unlabeled (Tensor): sigmoid(out_seg) for unlabeled samples,
+            shape = (B_u, H, W, D).
+        dis_to_mask_unlabeled (Tensor): sigmoid(-1500 * out_tanh) for unlabeled,
+            shape = (B_u, H, W, D).
+        W_unlabeled (Tensor): per-voxel task-agreement weight for unlabeled
+            samples, shape = (B_u, H, W, D). Computed with .detach() in caller.
+        tau (float): reliability threshold in (0, 1). Voxels with W > tau are
+            used. Default 0.8 — only the top ~20% most-agreed voxels contribute.
+
+    Returns:
+        loss (Tensor): scalar Dice loss on reliable voxels, or zero if none pass.
+    """
+    # Reliability mask: 1 where both tasks agree strongly
+    M = (W_unlabeled > tau).float()                        # (B_u, H, W, D)
+
+    if M.sum() < 1:
+        # No reliable voxel yet (early training) — skip gracefully
+        return torch.tensor(0.0, device=outputs_soft_unlabeled.device,
+                            requires_grad=False)
+
+    # Soft pseudo-label: average of the two task predictions at reliable voxels
+    pseudo = ((outputs_soft_unlabeled + dis_to_mask_unlabeled) / 2.0).detach()
+
+    # Apply mask to both prediction and pseudo-label
+    pred_masked   = outputs_soft_unlabeled * M
+    pseudo_masked = pseudo * M
+
+    # Dice loss on the masked volume
+    smooth = 1e-5
+    intersect = torch.sum(pred_masked * pseudo_masked)
+    pred_sum  = torch.sum(pred_masked  * pred_masked)
+    pseudo_sum = torch.sum(pseudo_masked * pseudo_masked)
+    loss = 1.0 - (2.0 * intersect + smooth) / (pred_sum + pseudo_sum + smooth)
+    return loss
+
+
 def adaptive_dtc_loss(dis_to_mask, outputs_soft, boundary_weight_map,
                       alpha=0.3, gamma=0.5):
     """
