@@ -26,7 +26,7 @@ from dataloaders.la_heart import (LAHeart, RandomCrop, CenterCrop,
                                    RandomRotFlip, ToTensor, TwoStreamBatchSampler)
 from utils.util import compute_sdf
 # NEW: import the two helper functions added to losses.py
-from utils.losses import compute_boundary_gt, adaptive_dtc_loss
+from utils.losses import compute_boundary_gt, adaptive_dtc_loss, pseudo_label_dice_loss
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
@@ -75,6 +75,14 @@ parser.add_argument('--adtc_gamma', type=float, default=0.5,
                          'W(x) = exp(-adtc_gamma * |dis_to_mask - outputs_soft|). '
                          'Higher = more aggressive down-weighting of uncertain voxels. '
                          'Default 0.5.')
+# NEW: confidence-gated pseudo-label Dice loss arguments
+parser.add_argument('--pseudo_tau', type=float, default=0.8,
+                    help='tau: reliability threshold for pseudo-label Dice loss. '
+                         'Only voxels with task-agreement weight W(x) > tau are used. '
+                         'Higher tau = fewer but more reliable voxels. Default 0.8.')
+parser.add_argument('--pseudo_weight', type=float, default=0.5,
+                    help='Weight of the pseudo-label Dice loss relative to the '
+                         'consistency loss. Default 0.5.')
 
 args = parser.parse_args()
 
@@ -252,6 +260,24 @@ if __name__ == "__main__":
                 gamma=args.adtc_gamma)        # disagreement weighting sharpness
 
             # ------------------------------------------------------------------
+            # NEW — Improvement 3: Confidence-gated pseudo-label Dice loss
+            # ------------------------------------------------------------------
+            # W(x) is already implicitly computed inside adaptive_dtc_loss.
+            # Re-derive it here explicitly for the unlabeled slice so we can
+            # threshold it to build the reliability mask M(x).
+            with torch.no_grad():
+                dis_unlabeled = dis_to_mask[labeled_bs:, 0, ...]   # (B_u, H, W, D)
+                seg_unlabeled = outputs_soft[labeled_bs:, 0, ...]   # (B_u, H, W, D)
+                W_unlabeled = torch.exp(
+                    -args.adtc_gamma * torch.abs(dis_unlabeled - seg_unlabeled))
+
+            loss_pseudo = pseudo_label_dice_loss(
+                seg_unlabeled,
+                dis_unlabeled,
+                W_unlabeled,
+                tau=args.pseudo_tau)
+
+            # ------------------------------------------------------------------
             # Total loss
             # ------------------------------------------------------------------
             # Supervised: dice + beta * sdf + boundary (labeled only)
@@ -260,7 +286,9 @@ if __name__ == "__main__":
             # Global ramp-up weight — unchanged from original DTC
             consistency_weight = get_current_consistency_weight(iter_num // 150)
 
-            loss = supervised_loss + consistency_weight * consistency_loss
+            loss = (supervised_loss
+                    + consistency_weight * consistency_loss
+                    + consistency_weight * args.pseudo_weight * loss_pseudo)
 
             optimizer.zero_grad()
             loss.backward()
@@ -281,14 +309,16 @@ if __name__ == "__main__":
             writer.add_scalar('loss/loss_dice', loss_seg_dice, iter_num)
             writer.add_scalar('loss/loss_hausdorff', loss_sdf, iter_num)
             writer.add_scalar('loss/loss_boundary', loss_boundary, iter_num)  # NEW
+            writer.add_scalar('loss/loss_pseudo_dice', loss_pseudo, iter_num)  # NEW
             writer.add_scalar('loss/consistency_weight', consistency_weight, iter_num)
             writer.add_scalar('loss/consistency_loss', consistency_loss, iter_num)
 
             logging.info(
                 'iteration %d : loss: %.4f  loss_consis: %.4f  loss_haus: %.4f  '
-                'loss_seg: %.4f  loss_dice: %.4f  loss_boundary: %.4f' %
+                'loss_seg: %.4f  loss_dice: %.4f  loss_boundary: %.4f  loss_pseudo: %.4f' %
                 (iter_num, loss.item(), consistency_loss.item(), loss_sdf.item(),
-                 loss_seg.item(), loss_seg_dice.item(), loss_boundary.item()))
+                 loss_seg.item(), loss_seg_dice.item(), loss_boundary.item(),
+                 loss_pseudo.item()))
 
             if iter_num % 50 == 0:
                 image = volume_batch[0, 0:1, :, :, 20:61:10].permute(
