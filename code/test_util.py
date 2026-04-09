@@ -105,7 +105,9 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
                 test_patch = torch.from_numpy(test_patch).cuda()
 
                 with torch.no_grad():
-                    y1_tanh, y1 = net(test_patch)
+                    # Network now returns three outputs: SDF, seg logits, boundary logits.
+                    # The boundary head (Task 3) is discarded at inference — only seg is used.
+                    y1_tanh, y1, _ = net(test_patch)
                     # ensemble
                     y = torch.sigmoid(y1)
                     dis_to_mask = torch.sigmoid(-1500*y1_tanh)
