@@ -16,7 +16,7 @@ def compute_dtm(img_gt, out_shape, normalize=False, fg=False):
     fg_dtm = np.zeros(out_shape)
 
     for b in range(out_shape[0]): # batch size
-        posmask = img_gt[b].astype(np.bool)
+        posmask = img_gt[b].astype(bool)
         if not fg:
             if posmask.any():
                 negmask = 1 - posmask
@@ -70,7 +70,7 @@ def save_sdf(gt_path=None):
     gt_path = dir_path + '/00_gt.nii.gz'
     gt_img = nib.load(gt_path)
     gt = gt_img.get_data().astype(np.uint8)
-    posmask = gt.astype(np.bool)
+    posmask = gt.astype(bool)
     negmask = ~posmask
     posdis = distance(posmask)
     negdis = distance(negmask)
@@ -101,7 +101,7 @@ def compute_sdf(img_gt, out_shape):
     normalized_sdf = np.zeros(out_shape)
 
     for b in range(out_shape[0]): # batch size
-        posmask = img_gt[b].astype(np.bool)
+        posmask = img_gt[b].astype(bool)
         if posmask.any():
             negmask = ~posmask
             posdis = distance(posmask)

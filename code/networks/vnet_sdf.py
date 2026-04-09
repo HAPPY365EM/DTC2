@@ -3,9 +3,17 @@ from torch import nn
 import torch.nn.functional as F
 
 """
-Differences with V-Net
-Adding nn.Tanh in the end of the conv. to make the outputs in [-1, 1].
+Modified VNet with three output heads:
+  - out_tanh   : SDF/LSF regression head (Task 2), output in [-1, 1]
+  - out_seg    : pixel-wise segmentation head (Task 1), raw logits
+  - out_boundary: lightweight boundary prediction head (Task 3), raw logits
+
+The boundary head is a single 1x1 Conv3d attached to the same x9 decoder
+feature map as the other two heads. It adds negligible parameters and
+requires no architectural changes to the encoder or decoder.
+At inference time, only out_seg is used (same as original DTC).
 """
+
 
 class ConvBlock(nn.Module):
     def __init__(self, n_stages, n_filters_in, n_filters_out, normalization='none'):
@@ -13,7 +21,7 @@ class ConvBlock(nn.Module):
 
         ops = []
         for i in range(n_stages):
-            if i==0:
+            if i == 0:
                 input_channel = n_filters_in
             else:
                 input_channel = n_filters_out
@@ -57,7 +65,7 @@ class ResidualConvBlock(nn.Module):
             elif normalization != 'none':
                 assert False
 
-            if i != n_stages-1:
+            if i != n_stages - 1:
                 ops.append(nn.ReLU(inplace=True))
 
         self.conv = nn.Sequential(*ops)
@@ -128,7 +136,7 @@ class Upsampling(nn.Module):
         super(Upsampling, self).__init__()
 
         ops = []
-        ops.append(nn.Upsample(scale_factor=stride, mode='trilinear',align_corners=False))
+        ops.append(nn.Upsample(scale_factor=stride, mode='trilinear', align_corners=False))
         ops.append(nn.Conv3d(n_filters_in, n_filters_out, kernel_size=3, padding=1))
         if normalization == 'batchnorm':
             ops.append(nn.BatchNorm3d(n_filters_out))
@@ -148,7 +156,8 @@ class Upsampling(nn.Module):
 
 
 class VNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=2, n_filters=16, normalization='none', has_dropout=False, has_residual=False):
+    def __init__(self, n_channels=3, n_classes=2, n_filters=16, normalization='none',
+                 has_dropout=False, has_residual=False):
         super(VNet, self).__init__()
         self.has_dropout = has_dropout
         convBlock = ConvBlock if not has_residual else ResidualConvBlock
@@ -178,12 +187,17 @@ class VNet(nn.Module):
         self.block_eight_up = UpsamplingDeconvBlock(n_filters * 2, n_filters, normalization=normalization)
 
         self.block_nine = convBlock(1, n_filters, n_filters, normalization=normalization)
-        self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
-        self.out_conv2 = nn.Conv3d(n_filters, n_classes, 1, padding=0)
-        self.tanh = nn.Tanh()
 
+        # Task 1: pixel-wise segmentation head (raw logits)
+        self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
+        # Task 2: SDF/LSF regression head (output passed through Tanh)
+        self.out_conv2 = nn.Conv3d(n_filters, n_classes, 1, padding=0)
+        # Task 3: boundary prediction head (raw logits, single channel)
+        # Single 1x1 Conv3d — negligible parameter overhead (~16 weights + bias)
+        self.out_conv3 = nn.Conv3d(n_filters, 1, 1, padding=0)
+
+        self.tanh = nn.Tanh()
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
-        # self.__init_weight()
 
     def encoder(self, input):
         x1 = self.block_one(input)
@@ -199,12 +213,10 @@ class VNet(nn.Module):
         x4_dw = self.block_four_dw(x4)
 
         x5 = self.block_five(x4_dw)
-        # x5 = F.dropout3d(x5, p=0.5, training=True)
         if self.has_dropout:
             x5 = self.dropout(x5)
 
         res = [x1, x2, x3, x4, x5]
-
         return res
 
     def decoder(self, features):
@@ -228,42 +240,39 @@ class VNet(nn.Module):
         x8 = self.block_eight(x7_up)
         x8_up = self.block_eight_up(x8)
         x8_up = x8_up + x1
+
         x9 = self.block_nine(x8_up)
-        # x9 = F.dropout3d(x9, p=0.5, training=True)
         if self.has_dropout:
             x9 = self.dropout(x9)
-        out = self.out_conv(x9)
-        out_tanh = self.tanh(out)
-        out_seg = self.out_conv2(x9)
-        return out_tanh, out_seg
 
+        # All three heads read from the same x9 feature map
+        out_tanh = self.tanh(self.out_conv(x9))   # Task 2: SDF in [-1, 1]
+        out_seg = self.out_conv2(x9)               # Task 1: seg logits
+        out_boundary = self.out_conv3(x9)          # Task 3: boundary logits
+        return out_tanh, out_seg, out_boundary
 
     def forward(self, input, turnoff_drop=False):
         if turnoff_drop:
             has_dropout = self.has_dropout
             self.has_dropout = False
         features = self.encoder(input)
-        out_tanh, out_seg = self.decoder(features)
+        out_tanh, out_seg, out_boundary = self.decoder(features)
         if turnoff_drop:
             self.has_dropout = has_dropout
-        return out_tanh, out_seg
+        return out_tanh, out_seg, out_boundary
 
-    # def __init_weight(self):
-    #     for m in self.modules():
-    #         if isinstance(m, nn.Conv3d):
-    #             torch.nn.init.kaiming_normal_(m.weight)
-    #         elif isinstance(m, nn.BatchNorm3d):
-    #             m.weight.data.fill_(1)
 
 if __name__ == '__main__':
-    # compute FLOPS & PARAMETERS
     from thop import profile
     from thop import clever_format
-    model = VNet(n_channels=1, n_classes=2)
+    model = VNet(n_channels=1, n_classes=1, normalization='batchnorm', has_dropout=False)
     input = torch.randn(4, 1, 112, 112, 80)
     flops, params = profile(model, inputs=(input,))
     macs, params = clever_format([flops, params], "%.3f")
     print(macs, params)
-    print("VNet have {} paramerters in total".format(sum(x.numel() for x in model.parameters())))
-
-    # import ipdb; ipdb.set_trace()
+    print("VNet have {} parameters in total".format(
+        sum(x.numel() for x in model.parameters())))
+    out_tanh, out_seg, out_boundary = model(input)
+    print("out_tanh shape:   ", out_tanh.shape)
+    print("out_seg shape:    ", out_seg.shape)
+    print("out_boundary shape:", out_boundary.shape)
