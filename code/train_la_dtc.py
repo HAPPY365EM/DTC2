@@ -27,6 +27,7 @@ from dataloaders.la_heart import (LAHeart, RandomCrop, CenterCrop,
 from utils.util import compute_sdf
 # NEW: import the two helper functions added to losses.py
 from utils.losses import compute_boundary_gt, adaptive_dtc_loss, pseudo_label_dice_loss
+from utils.losses_2 import hd_loss, compute_dtm
 from test_util import test_all_case
 
 parser = argparse.ArgumentParser()
@@ -76,14 +77,11 @@ parser.add_argument('--adtc_gamma', type=float, default=0.5,
                          'W(x) = exp(-adtc_gamma * |dis_to_mask - outputs_soft|). '
                          'Higher = more aggressive down-weighting of uncertain voxels. '
                          'Default 0.5.')
-# NEW: confidence-gated pseudo-label Dice loss arguments
-parser.add_argument('--pseudo_tau', type=float, default=0.8,
-                    help='tau: reliability threshold for pseudo-label Dice loss. '
-                         'Only voxels with task-agreement weight W(x) > tau are used. '
-                         'Higher tau = fewer but more reliable voxels. Default 0.8.')
-parser.add_argument('--pseudo_weight', type=float, default=0.5,
-                    help='Weight of the pseudo-label Dice loss relative to the '
-                         'consistency loss. Default 0.5.')
+# NEW: Hausdorff distance loss weight
+parser.add_argument('--hd_weight', type=float, default=0.1,
+                    help='Weight of the Hausdorff distance loss (supervised, labeled only). '
+                         'Directly penalises large surface deviations to reduce 95HD. '
+                         'Default 0.1.')
 
 args = parser.parse_args()
 
@@ -217,6 +215,19 @@ if __name__ == "__main__":
                 gt_boundary = torch.from_numpy(gt_boundary_np).float().cuda()
                 # shape: (labeled_bs, H, W, D)
 
+                # NEW: Distance Transform Map ground truth for HD loss
+                # compute_dtm returns a DTM where boundary=0, interior/exterior
+                # grow by Euclidean distance — used to weight surface errors.
+                # normalize=False keeps absolute voxel distances so the loss
+                # scale is stable; one_side=True in hd_loss uses only gt_dtm
+                # (not predicted DTM), keeping training stable.
+                gt_dtm_np = compute_dtm(
+                    label_batch[:labeled_bs].cpu().numpy(),
+                    outputs[:labeled_bs, 0, ...].shape,
+                    normalize=False)
+                gt_dtm = torch.from_numpy(gt_dtm_np).float().cuda()
+                # shape: (labeled_bs, H, W, D)
+
             # Task 2: SDF regression loss (unchanged)
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
 
@@ -232,6 +243,18 @@ if __name__ == "__main__":
             # squeeze channel dim to match gt_boundary shape (B, H, W, D)
             loss_boundary = ce_loss(
                 outputs_boundary[:labeled_bs, 0, ...], gt_boundary)
+
+            # NEW: Hausdorff distance loss on labeled samples only
+            # hd_loss weights segmentation errors by squared distance from
+            # the GT surface (via gt_dtm). Voxels far from the boundary
+            # contribute quadratically more, directly penalising the large
+            # surface deviations that inflate 95HD.
+            # one_side=True uses only gt_dtm (stable; no predicted DTM noise).
+            loss_hd = hd_loss(
+                outputs_soft[:labeled_bs, 0, ...],
+                label_batch[:labeled_bs],
+                gt_dtm=gt_dtm,
+                one_side=True)
 
             # ------------------------------------------------------------------
             # Consistency loss on ALL samples (labeled + unlabeled)
@@ -261,35 +284,21 @@ if __name__ == "__main__":
                 gamma=args.adtc_gamma)        # disagreement weighting sharpness
 
             # ------------------------------------------------------------------
-            # NEW — Improvement 3: Confidence-gated pseudo-label Dice loss
-            # ------------------------------------------------------------------
-            # W(x) is already implicitly computed inside adaptive_dtc_loss.
-            # Re-derive it here explicitly for the unlabeled slice so we can
-            # threshold it to build the reliability mask M(x).
-            with torch.no_grad():
-                dis_unlabeled = dis_to_mask[labeled_bs:, 0, ...]   # (B_u, H, W, D)
-                seg_unlabeled = outputs_soft[labeled_bs:, 0, ...]   # (B_u, H, W, D)
-                W_unlabeled = torch.exp(
-                    -args.adtc_gamma * torch.abs(dis_unlabeled - seg_unlabeled))
-
-            loss_pseudo = pseudo_label_dice_loss(
-                seg_unlabeled,
-                dis_unlabeled,
-                W_unlabeled,
-                tau=args.pseudo_tau)
-
-            # ------------------------------------------------------------------
             # Total loss
             # ------------------------------------------------------------------
-            # Supervised: dice + beta * sdf + boundary (labeled only)
-            supervised_loss = loss_seg_dice + args.beta * loss_sdf + loss_boundary
+            # Supervised: dice + beta*sdf + boundary + hd_weight*hd (labeled only)
+            # hd_loss is scaled by hd_weight (default 0.1) because its raw
+            # magnitude is larger than dice/sdf losses due to absolute voxel
+            # distances in gt_dtm.
+            supervised_loss = (loss_seg_dice
+                               + args.beta * loss_sdf
+                               + loss_boundary
+                               + args.hd_weight * loss_hd)
 
             # Global ramp-up weight — unchanged from original DTC
             consistency_weight = get_current_consistency_weight(iter_num // 150)
 
-            loss = (supervised_loss
-                    + consistency_weight * consistency_loss
-                    + consistency_weight * args.pseudo_weight * loss_pseudo)
+            loss = supervised_loss + consistency_weight * consistency_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -309,17 +318,17 @@ if __name__ == "__main__":
             writer.add_scalar('loss/loss_seg', loss_seg, iter_num)
             writer.add_scalar('loss/loss_dice', loss_seg_dice, iter_num)
             writer.add_scalar('loss/loss_hausdorff', loss_sdf, iter_num)
-            writer.add_scalar('loss/loss_boundary', loss_boundary, iter_num)  # NEW
-            writer.add_scalar('loss/loss_pseudo_dice', loss_pseudo, iter_num)  # NEW
+            writer.add_scalar('loss/loss_boundary', loss_boundary, iter_num)
+            writer.add_scalar('loss/loss_hd', loss_hd, iter_num)            # NEW
             writer.add_scalar('loss/consistency_weight', consistency_weight, iter_num)
             writer.add_scalar('loss/consistency_loss', consistency_loss, iter_num)
 
             logging.info(
                 'iteration %d : loss: %.4f  loss_consis: %.4f  loss_haus: %.4f  '
-                'loss_seg: %.4f  loss_dice: %.4f  loss_boundary: %.4f  loss_pseudo: %.4f' %
+                'loss_seg: %.4f  loss_dice: %.4f  loss_boundary: %.4f  loss_hd: %.4f' %
                 (iter_num, loss.item(), consistency_loss.item(), loss_sdf.item(),
                  loss_seg.item(), loss_seg_dice.item(), loss_boundary.item(),
-                 loss_pseudo.item()))
+                 loss_hd.item()))
 
             if iter_num % 50 == 0:
                 image = volume_batch[0, 0:1, :, :, 20:61:10].permute(
