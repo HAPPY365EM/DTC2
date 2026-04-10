@@ -27,6 +27,7 @@ from dataloaders.la_heart import (LAHeart, RandomCrop, CenterCrop,
 from utils.util import compute_sdf
 # NEW: import the two helper functions added to losses.py
 from utils.losses import compute_boundary_gt, adaptive_dtc_loss, pseudo_label_dice_loss
+from test_util import test_all_case
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
@@ -369,10 +370,43 @@ if __name__ == "__main__":
                     param_group['lr'] = lr_
 
             if iter_num % 1000 == 0:
+                # Save periodic checkpoint
                 save_mode_path = os.path.join(
                     snapshot_path, 'iter_' + str(iter_num) + '.pth')
                 torch.save(model.state_dict(), save_mode_path)
                 logging.info("save model to {}".format(save_mode_path))
+
+                # ----------------------------------------------------------
+                # Validation: run test_all_case on the val split and save
+                # best_model.pth whenever Dice improves.
+                # This ensures test_LA.py always has a valid best_model.pth
+                # that reflects the CURRENT training run, not a stale file.
+                # ----------------------------------------------------------
+                model.eval()
+                with open(train_data_path + '/test.list', 'r') as f:
+                    val_image_list = f.readlines()
+                val_image_list = [
+                    train_data_path + "/" + item.strip() + "/mri_norm2.h5"
+                    for item in val_image_list]
+
+                avg_metric = test_all_case(
+                    model, val_image_list, num_classes=num_classes,
+                    patch_size=patch_size, stride_xy=18, stride_z=4,
+                    save_result=False, metric_detail=0, nms=0)
+
+                val_dice = avg_metric[0]
+                writer.add_scalar('val/dice', val_dice, iter_num)
+                logging.info('iteration %d : val_dice : %.4f' % (iter_num, val_dice))
+
+                if val_dice > best_performance:
+                    best_performance = val_dice
+                    best_model_path = os.path.join(snapshot_path, 'best_model.pth')
+                    torch.save(model.state_dict(), best_model_path)
+                    logging.info(
+                        "=> New best model saved (dice=%.4f) to %s" %
+                        (best_performance, best_model_path))
+
+                model.train()
 
             if iter_num >= max_iterations:
                 break
