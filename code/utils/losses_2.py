@@ -1,5 +1,5 @@
-# import torch
-# from torch.nn import functional as F
+import torch
+from torch.nn import functional as F
 import numpy as np
 from scipy.ndimage import distance_transform_edt as distance
 from skimage import segmentation as skimage_seg
