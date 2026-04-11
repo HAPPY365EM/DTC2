@@ -77,10 +77,11 @@ parser.add_argument('--adtc_gamma', type=float, default=0.5,
                          'Higher = more aggressive down-weighting of uncertain voxels. '
                          'Default 0.5.')
 # NEW: Hausdorff distance loss weight
-parser.add_argument('--hd_weight', type=float, default=0.1,
+parser.add_argument('--hd_weight', type=float, default=0.3,
                     help='Weight of the Hausdorff distance loss (supervised, labeled only). '
                          'Directly penalises large surface deviations to reduce 95HD. '
-                         'Default 0.1.')
+                         'DTM is normalized to [0,1] so squared values are at most 1.0. '
+                         'Default 0.3.')
 
 args = parser.parse_args()
 
@@ -217,15 +218,18 @@ if __name__ == "__main__":
                 # NEW: Distance Transform Map ground truth for HD loss
                 # compute_dtm returns a DTM where boundary=0, interior/exterior
                 # grow by Euclidean distance — used to weight surface errors.
-                # normalize=False keeps absolute voxel distances so the loss
-                # scale is stable; one_side=True in hd_loss uses only gt_dtm
-                # (not predicted DTM), keeping training stable.
+                # normalize=True scales values to [0,1] so that after squaring
+                # inside hd_loss the magnitude stays comparable to dice_loss.
+                # Without normalization, raw voxel distances (~50) squared (~2500)
+                # overwhelm all other losses even at hd_weight=0.1.
+                # one_side=True in hd_loss uses only gt_dtm (stable; no predicted
+                # DTM noise).
                 gt_dtm_np = compute_dtm(
                     label_batch[:labeled_bs].cpu().numpy(),
                     outputs[:labeled_bs, 0, ...].shape,
-                    normalize=False)
+                    normalize=True)
                 gt_dtm = torch.from_numpy(gt_dtm_np).float().cuda()
-                # shape: (labeled_bs, H, W, D)
+                # shape: (labeled_bs, H, W, D), values in [0, 1]
 
             # Task 2: SDF regression loss (unchanged)
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
