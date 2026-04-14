@@ -25,8 +25,8 @@ from utils import ramps, losses, metrics
 from dataloaders.la_heart import (LAHeart, RandomCrop, CenterCrop,
                                    RandomRotFlip, ToTensor, TwoStreamBatchSampler)
 from utils.util import compute_sdf
-# NEW: import the two helper functions added to losses.py
-from utils.losses import compute_boundary_gt, adaptive_dtc_loss, pseudo_label_dice_loss
+# NEW: import the helper functions added to losses.py
+from utils.losses import compute_boundary_gt, adaptive_dtc_loss
 from utils.losses_2 import hd_loss, compute_dtm
 
 parser = argparse.ArgumentParser()
@@ -170,13 +170,6 @@ if __name__ == "__main__":
     ce_loss = BCEWithLogitsLoss()
     mse_loss = MSELoss()
 
-    if args.consistency_type == 'mse':
-        consistency_criterion = losses.softmax_mse_loss
-    elif args.consistency_type == 'kl':
-        consistency_criterion = losses.softmax_kl_loss
-    else:
-        assert False, args.consistency_type
-
     writer = SummaryWriter(snapshot_path + '/log')
     logging.info("{} iterations per epoch".format(len(trainloader)))
 
@@ -241,11 +234,19 @@ if __name__ == "__main__":
                 outputs_soft[:labeled_bs, 0, :, :, :],
                 label_batch[:labeled_bs] == 1)
 
-            # NEW Task 3: boundary BCE loss on labeled samples only
-            # out_conv3 outputs a single-channel logit map (B, 1, H, W, D);
-            # squeeze channel dim to match gt_boundary shape (B, H, W, D)
-            loss_boundary = ce_loss(
-                outputs_boundary[:labeled_bs, 0, ...], gt_boundary)
+            # NEW Task 3: boundary BCE loss on labeled samples only.
+            # Boundary voxels are ~1-3% of a 3D volume, so a flat BCE will find
+            # it near-optimal to predict all-background and the head collapses.
+            # pos_weight = (#neg / #pos) re-balances the loss so both classes
+            # contribute equally regardless of their volume fraction.
+            # Clamped to 50 to prevent exploding gradients on nearly-empty crops.
+            n_pos = gt_boundary.sum().clamp(min=1.0)
+            n_neg = (1.0 - gt_boundary).sum()
+            boundary_pos_weight = (n_neg / n_pos).clamp(max=50.0)
+            loss_boundary = F.binary_cross_entropy_with_logits(
+                outputs_boundary[:labeled_bs, 0, ...],
+                gt_boundary,
+                pos_weight=boundary_pos_weight)
 
             # NEW: Hausdorff distance loss on labeled samples only
             # hd_loss weights segmentation errors by squared distance from
@@ -289,13 +290,19 @@ if __name__ == "__main__":
             # ------------------------------------------------------------------
             # Total loss
             # ------------------------------------------------------------------
-            # Supervised: dice + beta*sdf + boundary + hd_weight*hd (labeled only)
-            # hd_loss is scaled by hd_weight (default 0.1) because its raw
-            # magnitude is larger than dice/sdf losses due to absolute voxel
-            # distances in gt_dtm.
-            supervised_loss = (loss_seg_dice
+            # Supervised losses (labeled samples only):
+            #   loss_seg      — BCE per-voxel: dense gradient signal, fast convergence
+            #   loss_seg_dice — Dice: region-normalised, robust to class imbalance
+            #   loss_sdf      — SDF regression: geometric shape constraint (Task 2)
+            #   loss_boundary — boundary BCE (pos_weight balanced): surface signal
+            #                   weighted 0.1 to prevent high-variance boundary
+            #                   gradients from drowning out Dice + SDF
+            #   loss_hd       — Hausdorff loss: penalises large surface deviations
+            #                   (DTM normalized to [0,1] so hd_weight=0.3 is safe)
+            supervised_loss = (loss_seg
+                               + loss_seg_dice
                                + args.beta * loss_sdf
-                               + loss_boundary
+                               + 0.1 * loss_boundary
                                + args.hd_weight * loss_hd)
 
             # Global ramp-up weight — unchanged from original DTC
