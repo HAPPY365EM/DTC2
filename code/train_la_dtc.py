@@ -25,7 +25,7 @@ from utils import ramps, losses, metrics
 from dataloaders.la_heart import (LAHeart, RandomCrop, CenterCrop,
                                    RandomRotFlip, ToTensor, TwoStreamBatchSampler)
 from utils.util import compute_sdf
-# NEW: import the helper functions added to losses.py
+# FIX 1: removed unused pseudo_label_dice_loss import
 from utils.losses import compute_boundary_gt, adaptive_dtc_loss
 from utils.losses_2 import hd_loss, compute_dtm
 
@@ -57,16 +57,12 @@ parser.add_argument('--gamma', type=float, default=0.5,
                     help='balance factor to control supervised and consistency loss')
 # costs
 parser.add_argument('--ema_decay', type=float, default=0.99, help='ema_decay')
-parser.add_argument('--consistency_type', type=str,
-                    default="kl", help='consistency_type')
-parser.add_argument('--with_cons', type=str,
-                    default="without_cons", help='with or without consistency')
 parser.add_argument('--consistency', type=float,
                     default=1.0, help='consistency')
 parser.add_argument('--consistency_rampup', type=float,
                     default=40.0, help='consistency_rampup')
 
-# NEW arguments for the two improvements
+# Arguments for boundary spatial emphasis and adaptive DTC weighting
 parser.add_argument('--boundary_weight', type=float, default=0.3,
                     help='alpha: boundary spatial emphasis strength in adaptive DTC loss. '
                          'Interior voxels receive weight (1-alpha), boundary voxels receive 1.0. '
@@ -76,12 +72,12 @@ parser.add_argument('--adtc_gamma', type=float, default=0.5,
                          'W(x) = exp(-adtc_gamma * |dis_to_mask - outputs_soft|). '
                          'Higher = more aggressive down-weighting of uncertain voxels. '
                          'Default 0.5.')
-# NEW: Hausdorff distance loss weight
-parser.add_argument('--hd_weight', type=float, default=0.3,
+# Hausdorff distance loss weight
+parser.add_argument('--hd_weight', type=float, default=0.1,
                     help='Weight of the Hausdorff distance loss (supervised, labeled only). '
                          'Directly penalises large surface deviations to reduce 95HD. '
                          'DTM is normalized to [0,1] so squared values are at most 1.0. '
-                         'Default 0.3.')
+                         'Default 0.1.')
 
 args = parser.parse_args()
 
@@ -117,7 +113,6 @@ def get_current_consistency_weight(epoch):
 
 
 if __name__ == "__main__":
-    # make logger file
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     if os.path.exists(snapshot_path + '/code'):
@@ -131,7 +126,6 @@ if __name__ == "__main__":
     logging.info(str(args))
 
     def create_model(ema=False):
-        # VNet now returns three outputs: out_tanh, out_seg, out_boundary
         net = VNet(n_channels=1, n_classes=num_classes - 1,
                    normalization='batchnorm', has_dropout=True)
         model = net.cuda()
@@ -170,6 +164,11 @@ if __name__ == "__main__":
     ce_loss = BCEWithLogitsLoss()
     mse_loss = MSELoss()
 
+    # FIX 2: removed dead consistency_criterion block — it was configured but
+    # never used anywhere in the training loop (adaptive_dtc_loss is called
+    # directly instead). Removing it eliminates the unused --consistency_type
+    # and --with_cons arguments that came with it.
+
     writer = SummaryWriter(snapshot_path + '/log')
     logging.info("{} iterations per epoch".format(len(trainloader)))
 
@@ -187,12 +186,12 @@ if __name__ == "__main__":
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
-            # Forward pass — now unpacks three outputs
+            # Forward pass — unpacks three outputs: SDF head, seg head, boundary head
             outputs_tanh, outputs, outputs_boundary = model(volume_batch)
             outputs_soft = torch.sigmoid(outputs)
 
             # ------------------------------------------------------------------
-            # Supervised losses on labeled samples only (indices :labeled_bs)
+            # Ground-truth preparation for supervised losses (labeled only)
             # ------------------------------------------------------------------
             with torch.no_grad():
                 # SDF ground truth for the LSF regression head (Task 2)
@@ -201,22 +200,16 @@ if __name__ == "__main__":
                     outputs[:labeled_bs, 0, ...].shape)
                 gt_dis = torch.from_numpy(gt_dis).float().cuda()
 
-                # NEW: boundary ground truth for the boundary head (Task 3)
-                # compute_boundary_gt runs on CPU numpy; no GPU memory overhead
+                # Boundary ground truth for the boundary head (Task 3)
                 gt_boundary_np = compute_boundary_gt(
                     label_batch[:labeled_bs].cpu().numpy())
                 gt_boundary = torch.from_numpy(gt_boundary_np).float().cuda()
                 # shape: (labeled_bs, H, W, D)
 
-                # NEW: Distance Transform Map ground truth for HD loss
-                # compute_dtm returns a DTM where boundary=0, interior/exterior
-                # grow by Euclidean distance — used to weight surface errors.
-                # normalize=True scales values to [0,1] so that after squaring
-                # inside hd_loss the magnitude stays comparable to dice_loss.
-                # Without normalization, raw voxel distances (~50) squared (~2500)
-                # overwhelm all other losses even at hd_weight=0.1.
-                # one_side=True in hd_loss uses only gt_dtm (stable; no predicted
-                # DTM noise).
+                # FIX 3: normalize=True keeps DTM values in [0, 1].
+                # Without normalization, raw voxel distances (~50 max) are
+                # squared inside hd_loss, producing values up to ~2500 that
+                # swamp all other losses even at hd_weight=0.1.
                 gt_dtm_np = compute_dtm(
                     label_batch[:labeled_bs].cpu().numpy(),
                     outputs[:labeled_bs, 0, ...].shape,
@@ -224,22 +217,26 @@ if __name__ == "__main__":
                 gt_dtm = torch.from_numpy(gt_dtm_np).float().cuda()
                 # shape: (labeled_bs, H, W, D), values in [0, 1]
 
-            # Task 2: SDF regression loss (unchanged)
+            # ------------------------------------------------------------------
+            # Supervised losses (labeled samples only)
+            # ------------------------------------------------------------------
+
+            # Task 2: SDF regression loss
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
 
-            # Task 1: segmentation losses (unchanged)
+            # Task 1: segmentation losses
             loss_seg = ce_loss(
                 outputs[:labeled_bs, 0, ...], label_batch[:labeled_bs].float())
             loss_seg_dice = losses.dice_loss(
                 outputs_soft[:labeled_bs, 0, :, :, :],
                 label_batch[:labeled_bs] == 1)
 
-            # NEW Task 3: boundary BCE loss on labeled samples only.
-            # Boundary voxels are ~1-3% of a 3D volume, so a flat BCE will find
-            # it near-optimal to predict all-background and the head collapses.
-            # pos_weight = (#neg / #pos) re-balances the loss so both classes
-            # contribute equally regardless of their volume fraction.
-            # Clamped to 50 to prevent exploding gradients on nearly-empty crops.
+            # Task 3: boundary BCE loss.
+            # FIX 4: boundary voxels are ~1-3% of a 112x112x80 volume. Without
+            # pos_weight, BCE trivially minimises by predicting all-background
+            # (loss -> 0) and the boundary head learns nothing.
+            # pos_weight = (#neg / #pos) equalises class contribution.
+            # Clamped to 50 to avoid gradient explosion on near-empty crops.
             n_pos = gt_boundary.sum().clamp(min=1.0)
             n_neg = (1.0 - gt_boundary).sum()
             boundary_pos_weight = (n_neg / n_pos).clamp(max=50.0)
@@ -248,12 +245,11 @@ if __name__ == "__main__":
                 gt_boundary,
                 pos_weight=boundary_pos_weight)
 
-            # NEW: Hausdorff distance loss on labeled samples only
-            # hd_loss weights segmentation errors by squared distance from
-            # the GT surface (via gt_dtm). Voxels far from the boundary
-            # contribute quadratically more, directly penalising the large
-            # surface deviations that inflate 95HD.
-            # one_side=True uses only gt_dtm (stable; no predicted DTM noise).
+            # Hausdorff distance loss.
+            # Weights segmentation errors by squared GT distance transform so
+            # voxels far from the surface contribute quadratically more, directly
+            # penalising large deviations that inflate 95HD.
+            # one_side=True uses only gt_dtm (avoids noisy predicted DTM).
             loss_hd = hd_loss(
                 outputs_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs],
@@ -263,13 +259,12 @@ if __name__ == "__main__":
             # ------------------------------------------------------------------
             # Consistency loss on ALL samples (labeled + unlabeled)
             # ------------------------------------------------------------------
-            # T^{-1} transform: convert LSF output to probability space
+            # T^{-1}: convert LSF output to probability space
             dis_to_mask = torch.sigmoid(-1500 * outputs_tanh)
 
-            # NEW: build the spatial boundary emphasis map S(x) for the full batch.
-            # For labeled samples: use gt_boundary derived from GT labels.
-            # For unlabeled samples: use a uniform ones-map (no GT available),
-            # which reduces adaptive_dtc_loss to pure adaptive weighting for them.
+            # Spatial boundary emphasis map for the full batch.
+            # Labeled: use GT boundary. Unlabeled: uniform ones (no GT),
+            # which reduces the loss to pure adaptive task-disagreement weighting.
             ones_unlabeled = torch.ones(
                 batch_size - labeled_bs,
                 *gt_boundary.shape[1:],
@@ -278,28 +273,27 @@ if __name__ == "__main__":
                 [gt_boundary, ones_unlabeled], dim=0)
             # shape: (batch_size, H, W, D)
 
-            # NEW: adaptive DTC loss replacing the original uniform MSE
-            # Original: consistency_loss = torch.mean((dis_to_mask - outputs_soft)**2)
+            # Adaptive DTC loss — replaces original uniform MSE consistency
             consistency_loss = adaptive_dtc_loss(
                 dis_to_mask,
                 outputs_soft,
                 boundary_weight_map,
-                alpha=args.boundary_weight,   # boundary spatial emphasis
-                gamma=args.adtc_gamma)        # disagreement weighting sharpness
+                alpha=args.boundary_weight,
+                gamma=args.adtc_gamma)
 
             # ------------------------------------------------------------------
             # Total loss
             # ------------------------------------------------------------------
-            # Supervised losses (labeled samples only):
-            #   loss_seg      — BCE per-voxel: dense gradient signal, fast convergence
-            #   loss_seg_dice — Dice: region-normalised, robust to class imbalance
-            #   loss_sdf      — SDF regression: geometric shape constraint (Task 2)
-            #   loss_boundary — boundary BCE (pos_weight balanced): surface signal
-            #                   weighted 0.1 to prevent high-variance boundary
-            #                   gradients from drowning out Dice + SDF
-            #   loss_hd       — Hausdorff loss: penalises large surface deviations
-            #                   (DTM normalized to [0,1] so hd_weight=0.3 is safe)
-            supervised_loss = (loss_seg
+            # 0.5 * loss_seg   — BCE at half weight: dense per-voxel gradient
+            #                    that supports but does not dominate loss_seg_dice
+            # loss_seg_dice    — Dice: region-normalised, robust to imbalance
+            # beta * loss_sdf  — SDF regression: geometric shape constraint
+            # 0.1 * loss_boundary — boundary BCE (pos_weight balanced); down-
+            #                       weighted so high-variance boundary gradients
+            #                       do not swamp Dice + SDF signals
+            # hd_weight * loss_hd — Hausdorff: penalises large surface errors
+            #                       (DTM in [0,1] so squared values are <= 1)
+            supervised_loss = (0.5 * loss_seg
                                + loss_seg_dice
                                + args.beta * loss_sdf
                                + 0.1 * loss_boundary
@@ -327,14 +321,14 @@ if __name__ == "__main__":
             writer.add_scalar('loss/loss', loss, iter_num)
             writer.add_scalar('loss/loss_seg', loss_seg, iter_num)
             writer.add_scalar('loss/loss_dice', loss_seg_dice, iter_num)
-            writer.add_scalar('loss/loss_hausdorff', loss_sdf, iter_num)
+            writer.add_scalar('loss/loss_sdf', loss_sdf, iter_num)
             writer.add_scalar('loss/loss_boundary', loss_boundary, iter_num)
-            writer.add_scalar('loss/loss_hd', loss_hd, iter_num)            # NEW
+            writer.add_scalar('loss/loss_hd', loss_hd, iter_num)
             writer.add_scalar('loss/consistency_weight', consistency_weight, iter_num)
             writer.add_scalar('loss/consistency_loss', consistency_loss, iter_num)
 
             logging.info(
-                'iteration %d : loss: %.4f  loss_consis: %.4f  loss_haus: %.4f  '
+                'iteration %d : loss: %.4f  loss_consis: %.4f  loss_sdf: %.4f  '
                 'loss_seg: %.4f  loss_dice: %.4f  loss_boundary: %.4f  loss_hd: %.4f' %
                 (iter_num, loss.item(), consistency_loss.item(), loss_sdf.item(),
                  loss_seg.item(), loss_seg_dice.item(), loss_boundary.item(),
@@ -371,7 +365,6 @@ if __name__ == "__main__":
                 grid_image = make_grid(image, 5, normalize=False)
                 writer.add_image('train/Groundtruth_DistMap', grid_image, iter_num)
 
-                # NEW: visualise predicted boundary and GT boundary
                 image = torch.sigmoid(outputs_boundary[0, 0:1, :, :, 20:61:10]).permute(
                     3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=False)
@@ -389,11 +382,6 @@ if __name__ == "__main__":
                     param_group['lr'] = lr_
 
             if iter_num % 1000 == 0:
-                # Save periodic checkpoint — consistent with original DTC paper.
-                # iter_6000.pth is the primary reported result, matching the
-                # evaluation protocol of UA-MT, SASSNet, and DTC.
-                # No test-set-informed model selection is performed here to
-                # avoid data leakage between validation and final evaluation.
                 save_mode_path = os.path.join(
                     snapshot_path, 'iter_' + str(iter_num) + '.pth')
                 torch.save(model.state_dict(), save_mode_path)
