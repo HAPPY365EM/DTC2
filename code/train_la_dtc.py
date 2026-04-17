@@ -56,6 +56,10 @@ parser.add_argument('--beta', type=float, default=0.3,
                     help='weight for SDF regression loss')
 parser.add_argument('--consistency', type=float, default=1.0,
                     help='consistency loss max weight')
+# Key fix: 40 -> 20. At 6000 iterations, rampup=40 means the consistency
+# weight only reaches ~0.6 by the end (epoch=6000//150=40 → weight=1.0 at
+# the very last step). With rampup=20, weight=1.0 from iter 3000 onward,
+# giving 3000 iterations of full EMA guidance instead of almost zero.
 parser.add_argument('--consistency_rampup', type=float, default=20.0,
                     help='consistency ramp-up length in epochs')
 parser.add_argument('--boundary_weight', type=float, default=0.3,
@@ -76,6 +80,10 @@ parser.add_argument('--aux_weight', type=float, default=0.2,
 # teacher prediction falls in (tau, 1-tau) are masked out as too uncertain.
 parser.add_argument('--ema_conf_tau', type=float, default=0.1,
                     help='EMA confidence threshold, range [0, 0.5]')
+# How often to run the EMA teacher forward pass. The teacher weights change
+# very slowly (alpha=0.99) so its predictions are nearly identical on
+# consecutive iterations. Running every 2 steps halves the extra compute
+# with negligible quality loss. The cached prediction is reused on odd steps.
 parser.add_argument('--ema_update_freq', type=int, default=2,
                     help='run EMA teacher forward pass every N iterations. '
                          'Default 2: halves overhead vs running every step.')
@@ -430,13 +438,13 @@ if __name__ == "__main__":
                 writer.add_image('train/Groundtruth_boundary',
                                  make_grid(img, 5, normalize=False), iter_num)
 
-                img = ema_prob[0:1, :, :, 20:61:10].unsqueeze(
-                    0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                img = ema_prob[0:1, :, :, 20:61:10].permute(
+                    3, 0, 1, 2).repeat(1, 3, 1, 1)
                 writer.add_image('train/EMA_teacher_pred',
                                  make_grid(img, 5, normalize=False), iter_num)
 
-                img = conf_mask[0:1, :, :, 20:61:10].unsqueeze(
-                    0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                img = conf_mask[0:1, :, :, 20:61:10].permute(
+                    3, 0, 1, 2).repeat(1, 3, 1, 1)
                 writer.add_image('train/EMA_conf_mask',
                                  make_grid(img, 5, normalize=False), iter_num)
 
