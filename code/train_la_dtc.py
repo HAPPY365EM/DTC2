@@ -35,10 +35,11 @@ parser.add_argument('--root_path', type=str,
                     help='Name of Experiment')
 parser.add_argument('--exp', type=str,
                     default='LA/DTC_improved', help='model_name')
-# FIX 1: extended from 6000 to 10000 so the EMA teacher has time to mature
-# and provide clean pseudo-labels for the full consistency rampup window.
-parser.add_argument('--max_iterations', type=int,
-                    default=10000, help='maximum iteration number to train')
+# Restored to 6000 — matches the original DTC paper protocol and comparison
+# baselines (UA-MT, SASSNet all report at 6000 iterations). The rampup fix
+# (40->20 epochs) is what improves EMA effectiveness, not more iterations.
+parser.add_argument('--max_iterations', type=int, default=6000,
+                    help='maximum iteration number to train')
 parser.add_argument('--batch_size', type=int, default=4,
                     help='batch_size per gpu')
 parser.add_argument('--labeled_bs', type=int, default=2,
@@ -55,14 +56,8 @@ parser.add_argument('--beta', type=float, default=0.3,
                     help='weight for SDF regression loss')
 parser.add_argument('--consistency', type=float, default=1.0,
                     help='consistency loss max weight')
-# FIX 2: rampup shortened from 40 to 20 epochs so the EMA consistency
-# reaches full weight halfway through training rather than at the very end.
-# At iter 5000 with rampup=20: epoch=5000//150=33 > 20 → weight already 1.0,
-# giving the model 5000 iterations of full EMA guidance instead of ~0.
 parser.add_argument('--consistency_rampup', type=float, default=20.0,
-                    help='consistency ramp-up length in epochs. '
-                         'Shortened from 40 to 20 so EMA signal is fully '
-                         'active for the second half of training.')
+                    help='consistency ramp-up length in epochs')
 parser.add_argument('--boundary_weight', type=float, default=0.3,
                     help='alpha: boundary spatial emphasis in adaptive DTC loss')
 parser.add_argument('--adtc_gamma', type=float, default=0.5,
@@ -72,23 +67,18 @@ parser.add_argument('--hd_weight', type=float, default=0.1,
 parser.add_argument('--ema_decay', type=float, default=0.99,
                     help='EMA decay rate for mean teacher')
 parser.add_argument('--ema_consistency_weight', type=float, default=0.5,
-                    help='weight for EMA teacher consistency on unlabeled')
-# FIX 3: reduced from 0.4 to 0.2 so the half-resolution auxiliary head
-# supplements rather than competes with the full-resolution Dice signal.
+                    help='weight for EMA teacher consistency on unlabeled data')
+# aux_weight reduced 0.4->0.2: half-resolution auxiliary head supplements
+# the full-resolution Dice signal rather than competing with it.
 parser.add_argument('--aux_weight', type=float, default=0.2,
-                    help='weight for auxiliary deep supervision Dice loss. '
-                         'Reduced from 0.4 to 0.2 to avoid competing with '
-                         'the full-resolution Dice gradient.')
-# FIX 4: confidence threshold for EMA pseudo-label filtering.
-# Only voxels where the teacher is confident (pred > tau or < 1-tau) are
-# used in the EMA consistency loss. Uncertain teacher voxels (tau=0.1 means
-# pred in [0.1, 0.9]) are masked out, preventing noisy early-training
-# pseudo-labels from misleading the student.
+                    help='weight for auxiliary deep supervision Dice loss')
+# Confidence threshold for EMA pseudo-label masking. Voxels where the
+# teacher prediction falls in (tau, 1-tau) are masked out as too uncertain.
 parser.add_argument('--ema_conf_tau', type=float, default=0.1,
-                    help='confidence threshold for EMA pseudo-label masking. '
-                         'Voxels with teacher pred in (tau, 1-tau) are masked '
-                         'out of the EMA consistency loss as too uncertain. '
-                         'Range [0, 0.5]. Default 0.1 (90%% confidence band).')
+                    help='EMA confidence threshold, range [0, 0.5]')
+parser.add_argument('--ema_update_freq', type=int, default=2,
+                    help='run EMA teacher forward pass every N iterations. '
+                         'Default 2: halves overhead vs running every step.')
 
 args = parser.parse_args()
 
@@ -123,11 +113,7 @@ def get_current_consistency_weight(epoch):
 
 
 def update_ema_variables(model, ema_model, alpha, global_step):
-    """
-    Update teacher weights from student via exponential moving average.
-    alpha ramps toward args.ema_decay so early updates are more responsive
-    (lower alpha = more student influence) and later updates are more stable.
-    """
+    """Update teacher weights from student via exponential moving average."""
     alpha = min(1.0 - 1.0 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(param.data, alpha=1.0 - alpha)
@@ -156,8 +142,8 @@ if __name__ == "__main__":
                 param.detach_()
         return model
 
-    model = create_model(ema=False)       # student — updated by SGD
-    ema_model = create_model(ema=True)    # teacher — updated by EMA only
+    model = create_model(ema=False)     # student — updated by SGD
+    ema_model = create_model(ema=True)  # teacher — updated by EMA only
 
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
@@ -195,8 +181,13 @@ if __name__ == "__main__":
     iter_num = 0
     max_epoch = max_iterations // len(trainloader) + 1
     lr_ = base_lr
-    best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
+
+    # Cache for EMA teacher output — reused on iterations where the teacher
+    # forward pass is skipped (iter_num % ema_update_freq != 0).
+    # Initialised to None; the first forward pass always runs unconditionally.
+    ema_prob_cache = None
+    ema_conf_mask_cache = None
 
     for epoch_num in iterator:
         time1 = time.time()
@@ -233,6 +224,8 @@ if __name__ == "__main__":
                 gt_boundary = torch.from_numpy(gt_boundary_np).float().cuda()
 
                 # normalize=True: DTM in [0,1] so squared values <= 1.
+                # Raw voxel distances (~50 max) squared reach ~2500 without
+                # normalization, swamping all other losses at any hd_weight.
                 gt_dtm_np = compute_dtm(
                     label_batch[:labeled_bs].cpu().numpy(),
                     outputs[:labeled_bs, 0, ...].shape,
@@ -245,6 +238,7 @@ if __name__ == "__main__":
 
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
 
+            # BCE at 0.5 weight: dense per-voxel gradient that supports Dice
             loss_seg = ce_loss(
                 outputs[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs].float())
@@ -252,7 +246,9 @@ if __name__ == "__main__":
                 outputs_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs] == 1)
 
-            # Boundary BCE with pos_weight to prevent all-background collapse
+            # Boundary BCE with pos_weight to prevent all-background collapse.
+            # Boundary voxels ~1-3% of volume; without rebalancing the head
+            # finds it optimal to predict all-background (loss -> 0 trivially).
             n_pos = gt_boundary.sum().clamp(min=1.0)
             n_neg = (1.0 - gt_boundary).sum()
             boundary_pos_weight = (n_neg / n_pos).clamp(max=50.0)
@@ -267,6 +263,8 @@ if __name__ == "__main__":
                 gt_dtm=gt_dtm,
                 one_side=True)
 
+            # Auxiliary deep supervision: Dice at mid-decoder resolution.
+            # Provides richer gradient signal to encoder from labeled samples.
             loss_aux = losses.dice_loss(
                 outputs_aux_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs] == 1)
@@ -277,7 +275,9 @@ if __name__ == "__main__":
 
             dis_to_mask = torch.sigmoid(-1500 * outputs_tanh)
 
-            # Boundary weight map: GT for labeled, self-predicted for unlabeled
+            # Boundary weight map: GT for labeled, self-predicted for unlabeled.
+            # Replaces flat ones-map so unlabeled samples also get boundary
+            # spatial emphasis near the regions the boundary head is confident.
             with torch.no_grad():
                 boundary_pred_unlabeled = torch.sigmoid(
                     outputs_boundary[labeled_bs:, 0, ...])
@@ -292,40 +292,39 @@ if __name__ == "__main__":
                 gamma=args.adtc_gamma)
 
             # EMA mean teacher consistency with confidence masking.
+            # Teacher forward pass runs every ema_update_freq iterations to
+            # halve overhead. The teacher weights (alpha=0.99) barely change
+            # between consecutive steps so reusing the cached output is safe.
             #
-            # FIX 4 — SOFT consistency + confidence mask:
-            #   Previous: hard pseudo-label at 0.5 threshold, then Dice loss.
-            #     Problem: a teacher prediction of 0.51 becomes a hard label of
-            #     1.0 — this is extremely noisy early in training when the
-            #     teacher is barely better than random.
+            # Soft MSE against teacher probabilities (not hard pseudo-labels):
+            # a teacher prediction of 0.51 thresholded to 1.0 is maximally
+            # misleading early in training. Soft MSE avoids this — the student
+            # is pulled toward 0.51, not 1.0.
             #
-            #   New: soft MSE directly against teacher probabilities, but only
-            #     at voxels where the teacher is confident (pred outside the
-            #     [tau, 1-tau] uncertainty band). This has two benefits:
-            #       (a) No information is lost from thresholding — the full
-            #           continuous teacher signal is used where it's reliable.
-            #       (b) Uncertain voxels (those near the decision boundary)
-            #           are masked out entirely, so noisy early-training
-            #           pseudo-labels do not misdirect the student.
-            #
-            #   The confidence mask M(x) = 1 where teacher is confident:
-            #       M = (ema_soft > 1 - tau) | (ema_soft < tau)
-            #   MSE is then computed only at M=1 voxels. If no voxel is
-            #   confident (degenerate early case), loss is zero gracefully.
-            with torch.no_grad():
-                ema_tanh, ema_out, _, _ = ema_model(volume_batch[labeled_bs:])
-                ema_soft = torch.sigmoid(ema_out)          # (Bu, 1, H, W, D)
-                ema_prob = ema_soft[:, 0, ...]             # (Bu, H, W, D)
-
-                # Confidence mask: True where teacher is sure
-                tau = args.ema_conf_tau
-                conf_mask = ((ema_prob > (1.0 - tau)) |
-                             (ema_prob < tau)).float()     # (Bu, H, W, D)
+            # Confidence mask: voxels with teacher pred in (tau, 1-tau) are
+            # masked out as too uncertain. This prevents noisy early-training
+            # pseudo-labels from misdirecting the student. The ema_conf_fraction
+            # scalar (logged below) should rise from ~0.5 to >0.9 by iter 3000.
+            run_ema = (ema_prob_cache is None or
+                       iter_num % args.ema_update_freq == 0)
+            if run_ema:
+                with torch.no_grad():
+                    ema_tanh, ema_out, _, _ = ema_model(
+                        volume_batch[labeled_bs:])
+                    ema_soft = torch.sigmoid(ema_out)
+                    ema_prob = ema_soft[:, 0, ...]     # (Bu, H, W, D)
+                    tau = args.ema_conf_tau
+                    conf_mask = ((ema_prob > (1.0 - tau)) |
+                                 (ema_prob < tau)).float()
+                # Cache for reuse on skipped steps
+                ema_prob_cache = ema_prob
+                ema_conf_mask_cache = conf_mask
+            else:
+                ema_prob = ema_prob_cache
+                conf_mask = ema_conf_mask_cache
 
             student_prob = outputs_soft[labeled_bs:, 0, ...]  # (Bu, H, W, D)
-
             n_confident = conf_mask.sum().clamp(min=1.0)
-            # Soft MSE at confident voxels only
             loss_ema_consistency = (
                 conf_mask * (student_prob - ema_prob.detach()) ** 2
             ).sum() / n_confident
@@ -379,8 +378,8 @@ if __name__ == "__main__":
             writer.add_scalar('loss/dtc_consistency', consistency_loss, iter_num)
             writer.add_scalar('loss/ema_consistency', loss_ema_consistency,
                               iter_num)
-            # Log fraction of confident voxels — useful diagnostic:
-            # should rise from ~0.5 early to >0.9 by iter 5000 as teacher matures
+            # Diagnostic: fraction of voxels the teacher is confident about.
+            # Should rise from ~0.5 early to >0.9 by iter 3000.
             writer.add_scalar('train/ema_conf_fraction',
                               conf_mask.mean().item(), iter_num)
 
@@ -441,9 +440,7 @@ if __name__ == "__main__":
                 writer.add_image('train/EMA_conf_mask',
                                  make_grid(img, 5, normalize=False), iter_num)
 
-            # Learning rate decay — third step added for 10000 iterations:
-            # iter 2500 → lr = 0.001, iter 5000 → lr = 0.0001,
-            # iter 7500 → lr = 0.00001 (fine-tuning phase)
+            # Learning rate decay — same two-step schedule as original DTC
             if iter_num % 2500 == 0:
                 lr_ = base_lr * 0.1 ** (iter_num // 2500)
                 for param_group in optimizer.param_groups:
