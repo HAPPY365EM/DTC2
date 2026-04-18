@@ -56,11 +56,7 @@ parser.add_argument('--beta', type=float, default=0.3,
                     help='weight for SDF regression loss')
 parser.add_argument('--consistency', type=float, default=1.0,
                     help='consistency loss max weight')
-# Key fix: 40 -> 20. At 6000 iterations, rampup=40 means the consistency
-# weight only reaches ~0.6 by the end (epoch=6000//150=40 → weight=1.0 at
-# the very last step). With rampup=20, weight=1.0 from iter 3000 onward,
-# giving 3000 iterations of full EMA guidance instead of almost zero.
-parser.add_argument('--consistency_rampup', type=float, default=20.0,
+parser.add_argument('--consistency_rampup', type=float, default=40.0,
                     help='consistency ramp-up length in epochs')
 parser.add_argument('--boundary_weight', type=float, default=0.3,
                     help='alpha: boundary spatial emphasis in adaptive DTC loss')
@@ -80,14 +76,6 @@ parser.add_argument('--aux_weight', type=float, default=0.2,
 # teacher prediction falls in (tau, 1-tau) are masked out as too uncertain.
 parser.add_argument('--ema_conf_tau', type=float, default=0.1,
                     help='EMA confidence threshold, range [0, 0.5]')
-# How often to run the EMA teacher forward pass. The teacher weights change
-# very slowly (alpha=0.99) so its predictions are nearly identical on
-# consecutive iterations. Running every 2 steps halves the extra compute
-# with negligible quality loss. The cached prediction is reused on odd steps.
-parser.add_argument('--ema_update_freq', type=int, default=2,
-                    help='run EMA teacher forward pass every N iterations. '
-                         'Default 2: halves overhead vs running every step.')
-
 args = parser.parse_args()
 
 train_data_path = args.root_path
@@ -190,12 +178,6 @@ if __name__ == "__main__":
     max_epoch = max_iterations // len(trainloader) + 1
     lr_ = base_lr
     iterator = tqdm(range(max_epoch), ncols=70)
-
-    # Cache for EMA teacher output — reused on iterations where the teacher
-    # forward pass is skipped (iter_num % ema_update_freq != 0).
-    # Initialised to None; the first forward pass always runs unconditionally.
-    ema_prob_cache = None
-    ema_conf_mask_cache = None
 
     for epoch_num in iterator:
         time1 = time.time()
@@ -300,36 +282,28 @@ if __name__ == "__main__":
                 gamma=args.adtc_gamma)
 
             # EMA mean teacher consistency with confidence masking.
-            # Teacher forward pass runs every ema_update_freq iterations to
-            # halve overhead. The teacher weights (alpha=0.99) barely change
-            # between consecutive steps so reusing the cached output is safe.
+            #
+            # The teacher forward pass MUST run on the current unlabeled batch
+            # every iteration — prediction caching across iterations is a bug
+            # because the input batch changes each step. A cached prediction
+            # from batch N applied to student outputs from batch N+1 creates a
+            # completely mismatched consistency target (random gradient signal).
             #
             # Soft MSE against teacher probabilities (not hard pseudo-labels):
-            # a teacher prediction of 0.51 thresholded to 1.0 is maximally
-            # misleading early in training. Soft MSE avoids this — the student
-            # is pulled toward 0.51, not 1.0.
+            # thresholding a teacher prediction of 0.51 to a hard label of 1.0
+            # is maximally misleading early in training. Soft MSE keeps the
+            # full continuous signal — the student is pulled toward 0.51, not 1.0.
             #
             # Confidence mask: voxels with teacher pred in (tau, 1-tau) are
-            # masked out as too uncertain. This prevents noisy early-training
-            # pseudo-labels from misdirecting the student. The ema_conf_fraction
-            # scalar (logged below) should rise from ~0.5 to >0.9 by iter 3000.
-            run_ema = (ema_prob_cache is None or
-                       iter_num % args.ema_update_freq == 0)
-            if run_ema:
-                with torch.no_grad():
-                    ema_tanh, ema_out, _, _ = ema_model(
-                        volume_batch[labeled_bs:])
-                    ema_soft = torch.sigmoid(ema_out)
-                    ema_prob = ema_soft[:, 0, ...]     # (Bu, H, W, D)
-                    tau = args.ema_conf_tau
-                    conf_mask = ((ema_prob > (1.0 - tau)) |
-                                 (ema_prob < tau)).float()
-                # Cache for reuse on skipped steps
-                ema_prob_cache = ema_prob
-                ema_conf_mask_cache = conf_mask
-            else:
-                ema_prob = ema_prob_cache
-                conf_mask = ema_conf_mask_cache
+            # masked out as too uncertain. ema_conf_fraction logged below
+            # should rise from ~0.5 early to >0.9 by iter 3000.
+            with torch.no_grad():
+                ema_tanh, ema_out, _, _ = ema_model(volume_batch[labeled_bs:])
+                ema_soft = torch.sigmoid(ema_out)
+                ema_prob = ema_soft[:, 0, ...]          # (Bu, H, W, D)
+                tau = args.ema_conf_tau
+                conf_mask = ((ema_prob > (1.0 - tau)) |
+                             (ema_prob < tau)).float()   # (Bu, H, W, D)
 
             student_prob = outputs_soft[labeled_bs:, 0, ...]  # (Bu, H, W, D)
             n_confident = conf_mask.sum().clamp(min=1.0)
