@@ -72,10 +72,7 @@ parser.add_argument('--ema_consistency_weight', type=float, default=0.5,
 # the full-resolution Dice signal rather than competing with it.
 parser.add_argument('--aux_weight', type=float, default=0.2,
                     help='weight for auxiliary deep supervision Dice loss')
-# Confidence threshold for EMA pseudo-label masking. Voxels where the
-# teacher prediction falls in (tau, 1-tau) are masked out as too uncertain.
-parser.add_argument('--ema_conf_tau', type=float, default=0.1,
-                    help='EMA confidence threshold, range [0, 0.5]')
+
 args = parser.parse_args()
 
 train_data_path = args.root_path
@@ -281,35 +278,29 @@ if __name__ == "__main__":
                 alpha=args.boundary_weight,
                 gamma=args.adtc_gamma)
 
-            # EMA mean teacher consistency with confidence masking.
+            # EMA mean teacher consistency — Dice loss against hard pseudo-labels.
             #
-            # The teacher forward pass MUST run on the current unlabeled batch
-            # every iteration — prediction caching across iterations is a bug
-            # because the input batch changes each step. A cached prediction
-            # from batch N applied to student outputs from batch N+1 creates a
-            # completely mismatched consistency target (random gradient signal).
+            # This is the EMA v1 formulation that produced the best result (89.82).
+            # The teacher's prediction is thresholded at 0.5 to create a hard
+            # pseudo-label, and the student is trained to match it via Dice loss.
             #
-            # Soft MSE against teacher probabilities (not hard pseudo-labels):
-            # thresholding a teacher prediction of 0.51 to a hard label of 1.0
-            # is maximally misleading early in training. Soft MSE keeps the
-            # full continuous signal — the student is pulled toward 0.51, not 1.0.
+            # Why Dice and not MSE: the left atrium occupies ~30% of the volume.
+            # MSE treats every voxel equally, so 70% of the gradient comes from
+            # background voxels. Dice normalises by region size, giving foreground
+            # and background equal contribution regardless of class imbalance.
             #
-            # Confidence mask: voxels with teacher pred in (tau, 1-tau) are
-            # masked out as too uncertain. ema_conf_fraction logged below
-            # should rise from ~0.5 early to >0.9 by iter 3000.
+            # Why hard labels and not soft: empirically, soft MSE + confidence
+            # masking performed worse (88.04 Dice vs 89.82 with hard Dice), likely
+            # because the confidence mask disproportionately removes foreground
+            # boundary voxels — the hardest and most informative voxels to learn.
             with torch.no_grad():
                 ema_tanh, ema_out, _, _ = ema_model(volume_batch[labeled_bs:])
                 ema_soft = torch.sigmoid(ema_out)
-                ema_prob = ema_soft[:, 0, ...]          # (Bu, H, W, D)
-                tau = args.ema_conf_tau
-                conf_mask = ((ema_prob > (1.0 - tau)) |
-                             (ema_prob < tau)).float()   # (Bu, H, W, D)
+                ema_pseudo = (ema_soft[:, 0, ...] > 0.5).float()
 
-            student_prob = outputs_soft[labeled_bs:, 0, ...]  # (Bu, H, W, D)
-            n_confident = conf_mask.sum().clamp(min=1.0)
-            loss_ema_consistency = (
-                conf_mask * (student_prob - ema_prob.detach()) ** 2
-            ).sum() / n_confident
+            loss_ema_consistency = losses.dice_loss(
+                outputs_soft[labeled_bs:, 0, ...],
+                ema_pseudo)
 
             # ------------------------------------------------------------------
             # Total loss
@@ -360,20 +351,14 @@ if __name__ == "__main__":
             writer.add_scalar('loss/dtc_consistency', consistency_loss, iter_num)
             writer.add_scalar('loss/ema_consistency', loss_ema_consistency,
                               iter_num)
-            # Diagnostic: fraction of voxels the teacher is confident about.
-            # Should rise from ~0.5 early to >0.9 by iter 3000.
-            writer.add_scalar('train/ema_conf_fraction',
-                              conf_mask.mean().item(), iter_num)
 
             logging.info(
                 'iter %d : loss=%.4f  dice=%.4f  sdf=%.4f  bce=%.4f  '
-                'bnd=%.4f  hd=%.4f  aux=%.4f  dtc=%.4f  ema=%.4f  '
-                'conf=%.3f  w=%.4f' % (
+                'bnd=%.4f  hd=%.4f  aux=%.4f  dtc=%.4f  ema=%.4f  w=%.4f' % (
                     iter_num, loss.item(), loss_seg_dice.item(),
                     loss_sdf.item(), loss_seg.item(), loss_boundary.item(),
                     loss_hd.item(), loss_aux.item(), consistency_loss.item(),
-                    loss_ema_consistency.item(),
-                    conf_mask.mean().item(), consistency_weight))
+                    loss_ema_consistency.item(), consistency_weight))
 
             if iter_num % 50 == 0:
                 img = volume_batch[0, 0:1, :, :, 20:61:10].permute(
@@ -412,14 +397,9 @@ if __name__ == "__main__":
                 writer.add_image('train/Groundtruth_boundary',
                                  make_grid(img, 5, normalize=False), iter_num)
 
-                img = ema_prob[0:1, :, :, 20:61:10].permute(
+                img = ema_soft[0, 0:1, :, :, 20:61:10].permute(
                     3, 0, 1, 2).repeat(1, 3, 1, 1)
                 writer.add_image('train/EMA_teacher_pred',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = conf_mask[0:1, :, :, 20:61:10].permute(
-                    3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/EMA_conf_mask',
                                  make_grid(img, 5, normalize=False), iter_num)
 
             # Learning rate decay — same two-step schedule as original DTC
