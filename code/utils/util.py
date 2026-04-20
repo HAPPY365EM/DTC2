@@ -12,38 +12,17 @@ from skimage import segmentation as skimage_seg
 import torch
 from torch.utils.data.sampler import Sampler
 
-import networks
-
-def load_model(path):
-    """Loads model and return it without DataParallel table."""
-    if os.path.isfile(path):
-        print("=> loading checkpoint '{}'".format(path))
-        checkpoint = torch.load(path)
-
-        # size of the top layer
-        N = checkpoint['state_dict']['top_layer.bias'].size()
-
-        # build skeleton of the model
-        sob = 'sobel.0.weight' in checkpoint['state_dict'].keys()
-        model = models.__dict__[checkpoint['arch']](sobel=sob, out=int(N[0]))
-
-        # deal with a dataparallel table
-        def rename_key(key):
-            if not 'module' in key:
-                return key
-            return ''.join(key.split('.module'))
-
-        checkpoint['state_dict'] = {rename_key(key): val
-                                    for key, val
-                                    in checkpoint['state_dict'].items()}
-
-        # load weights
-        model.load_state_dict(checkpoint['state_dict'])
-        print("Loaded")
-    else:
-        model = None
-        print("=> no checkpoint found at '{}'".format(path))
-    return model
+# FIX: removed `import networks` which was copied from an unrelated codebase
+# and referred to a `networks` package and a `models` variable that do not
+# exist in this project. Because Python executes all top-level imports when a
+# module is first loaded, this caused an ImportError whenever train_la_dtc.py
+# ran `from utils.util import compute_sdf`, even though load_model() (the only
+# function that referenced `networks`) was never called.
+#
+# load_model() itself is also unused in this project — it was leftover scaffold
+# from the original Facebook Research clustering codebase. It has been removed
+# below to avoid confusion. If you need checkpoint loading, use torch.load()
+# directly in your training / evaluation scripts.
 
 
 class UnifLabelSampler(Sampler):
@@ -122,29 +101,33 @@ class Logger():
 
 def compute_sdf(img_gt, out_shape):
     """
-    compute the signed distance map of binary mask
-    input: segmentation, shape = (batch_size, x, y, z)
-    output: the Signed Distance Map (SDM)
-    sdf(x) = 0; x in segmentation boundary
-             -inf|x-y|; x in segmentation
-             +inf|x-y|; x out of segmentation
-    normalize sdf to [-1,1]
-    """
+    Compute the signed distance map of a binary segmentation mask.
 
+    Args:
+        img_gt  (np.ndarray): integer mask, shape = (batch_size, x, y, z).
+        out_shape (tuple):    desired output shape, same as img_gt.shape.
+
+    Returns:
+        normalized_sdf (np.ndarray): float64 SDF normalised to [-1, 1],
+            shape = out_shape.
+            sdf(x) = 0   on the segmentation boundary
+                   < 0   inside  the segmentation (normalised negative distance)
+                   > 0   outside the segmentation (normalised positive distance)
+    """
     img_gt = img_gt.astype(np.uint8)
     normalized_sdf = np.zeros(out_shape)
 
-    for b in range(out_shape[0]): # batch size
+    for b in range(out_shape[0]):  # batch size
         posmask = img_gt[b].astype(bool)
         if posmask.any():
             negmask = ~posmask
             posdis = distance(posmask)
             negdis = distance(negmask)
-            boundary = skimage_seg.find_boundaries(posmask, mode='inner').astype(np.uint8)
-            sdf = (negdis-np.min(negdis))/(np.max(negdis)-np.min(negdis)) - (posdis-np.min(posdis))/(np.max(posdis)-np.min(posdis))
-            sdf[boundary==1] = 0
+            boundary = skimage_seg.find_boundaries(
+                posmask, mode='inner').astype(np.uint8)
+            sdf = ((negdis - np.min(negdis)) / (np.max(negdis) - np.min(negdis))
+                   - (posdis - np.min(posdis)) / (np.max(posdis) - np.min(posdis)))
+            sdf[boundary == 1] = 0
             normalized_sdf[b] = sdf
-            # assert np.min(sdf) == -1.0, print(np.min(posdis), np.max(posdis), np.min(negdis), np.max(negdis))
-            # assert np.max(sdf) ==  1.0, print(np.min(posdis), np.min(negdis), np.max(posdis), np.max(negdis))
 
     return normalized_sdf
