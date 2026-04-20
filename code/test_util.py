@@ -110,20 +110,39 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
                     np.expand_dims(test_patch, axis=0), axis=0).astype(np.float32)
                 test_patch = torch.from_numpy(test_patch).cuda()
 
+                # Test-time augmentation: average predictions over all 8
+                # flip combinations (2^3 across the W, H, D spatial axes).
+                # Each patch is flipped before inference and flipped back
+                # before accumulation, so all 8 views are in the same space.
+                # Seg and SDF heads are ensembled within each augmentation.
+                # TTA adds ~8x inference time per patch but zero training cost.
+                y_tta = torch.zeros(
+                    1, num_classes, *test_patch.shape[2:],
+                    device=test_patch.device)
+                flip_axes_list = [
+                    [],        # original
+                    [2],       # flip W
+                    [3],       # flip H
+                    [4],       # flip D
+                    [2, 3],    # flip W+H
+                    [2, 4],    # flip W+D
+                    [3, 4],    # flip H+D
+                    [2, 3, 4], # flip W+H+D
+                ]
                 with torch.no_grad():
-                    # Network returns four outputs.
-                    # Boundary head (Task 3) and auxiliary head are discarded
-                    # at inference — only seg and SDF heads are used.
-                    y1_tanh, y1, _, _ = net(test_patch)
+                    for flip_axes in flip_axes_list:
+                        patch_aug = torch.flip(test_patch, flip_axes) \
+                            if flip_axes else test_patch
+                        y1_tanh, y1, _, _ = net(patch_aug)
+                        y_seg = torch.sigmoid(y1)
+                        y_sdf = torch.sigmoid(-1500 * y1_tanh)
+                        y_aug = 0.5 * y_seg + 0.5 * y_sdf
+                        if flip_axes:
+                            y_aug = torch.flip(y_aug, flip_axes)
+                        y_tta += y_aug
+                    y_tta /= len(flip_axes_list)
 
-                    # Ensemble seg head and SDF head in probability space.
-                    # The SDF head provides complementary geometric signal
-                    # that improves surface metrics at no training cost.
-                    y_seg = torch.sigmoid(y1)
-                    y_sdf = torch.sigmoid(-1500 * y1_tanh)
-                    y = 0.5 * y_seg + 0.5 * y_sdf
-
-                y = y.cpu().data.numpy()
+                y = y_tta.cpu().data.numpy()
                 y = y[0, :, :, :, :]
                 score_map[:, xs:xs + patch_size[0],
                              ys:ys + patch_size[1],
