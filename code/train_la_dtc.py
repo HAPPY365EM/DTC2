@@ -34,10 +34,7 @@ parser.add_argument('--root_path', type=str,
                     default='../data/2018LA_Seg_Training Set/',
                     help='Name of Experiment')
 parser.add_argument('--exp', type=str,
-                    default='LA/DTC_improved', help='model_name')
-# Restored to 6000 — matches the original DTC paper protocol and comparison
-# baselines (UA-MT, SASSNet all report at 6000 iterations). The rampup fix
-# (40->20 epochs) is what improves EMA effectiveness, not more iterations.
+                    default='LA/DTC_improved_fixed', help='model_name')
 parser.add_argument('--max_iterations', type=int, default=6000,
                     help='maximum iteration number to train')
 parser.add_argument('--batch_size', type=int, default=4,
@@ -60,16 +57,12 @@ parser.add_argument('--consistency_rampup', type=float, default=40.0,
                     help='consistency ramp-up length in epochs')
 parser.add_argument('--boundary_weight', type=float, default=0.3,
                     help='alpha: boundary spatial emphasis in adaptive DTC loss')
-parser.add_argument('--adtc_gamma', type=float, default=0.5,
-                    help='gamma: sharpness of task-disagreement weighting')
-parser.add_argument('--hd_weight', type=float, default=0.1,
-                    help='weight for Hausdorff distance loss')
+parser.add_argument('--hd_weight', type=float, default=0.05,
+                    help='weight for Hausdorff distance loss (reduced to prevent boundary suppression)')
 parser.add_argument('--ema_decay', type=float, default=0.99,
                     help='EMA decay rate for mean teacher')
 parser.add_argument('--ema_consistency_weight', type=float, default=0.5,
                     help='weight for EMA teacher consistency on unlabeled data')
-# aux_weight reduced 0.4->0.2: half-resolution auxiliary head supplements
-# the full-resolution Dice signal rather than competing with it.
 parser.add_argument('--aux_weight', type=float, default=0.2,
                     help='weight for auxiliary deep supervision Dice loss')
 
@@ -106,10 +99,23 @@ def get_current_consistency_weight(epoch):
 
 
 def update_ema_variables(model, ema_model, alpha, global_step):
-    """Update teacher weights from student via exponential moving average."""
+    """
+    Fix: Update BOTH parameters and buffers (BatchNorm stats).
+    This is critical for the Teacher model to work correctly.
+    """
     alpha = min(1.0 - 1.0 / (global_step + 1), alpha)
+    
+    # Update parameters (weights & biases)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(param.data, alpha=1.0 - alpha)
+    
+    # Update buffers (running_mean, running_var for BatchNorm)
+    for ema_buf, buf in zip(ema_model.buffers(), model.buffers()):
+        if buf.dtype == torch.float32:
+            ema_buf.data.mul_(alpha).add_(buf.data, alpha=1.0 - alpha)
+        else:
+            # For integer buffers like num_batches_tracked, just copy
+            ema_buf.data.copy_(buf.data)
 
 
 if __name__ == "__main__":
@@ -135,8 +141,8 @@ if __name__ == "__main__":
                 param.detach_()
         return model
 
-    model = create_model(ema=False)     # student — updated by SGD
-    ema_model = create_model(ema=True)  # teacher — updated by EMA only
+    model = create_model(ema=False)     # student
+    ema_model = create_model(ema=True)  # teacher
 
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
@@ -186,19 +192,19 @@ if __name__ == "__main__":
             volume_batch, label_batch = (volume_batch.cuda(),
                                          label_batch.cuda())
 
-            # Student forward pass — 4 outputs
+            # Student forward pass
             outputs_tanh, outputs, outputs_boundary, outputs_aux = \
                 model(volume_batch)
             outputs_soft = torch.sigmoid(outputs)
 
-            # Upsample auxiliary output (56x56x40) to full patch size (112x112x80)
+            # Upsample auxiliary output
             outputs_aux_up = F.interpolate(
                 outputs_aux, size=patch_size, mode='trilinear',
                 align_corners=False)
             outputs_aux_soft = torch.sigmoid(outputs_aux_up)
 
             # ------------------------------------------------------------------
-            # Ground-truth preparation (no gradient needed)
+            # Ground-truth preparation
             # ------------------------------------------------------------------
             with torch.no_grad():
                 gt_dis = compute_sdf(
@@ -210,9 +216,6 @@ if __name__ == "__main__":
                     label_batch[:labeled_bs].cpu().numpy())
                 gt_boundary = torch.from_numpy(gt_boundary_np).float().cuda()
 
-                # normalize=True: DTM in [0,1] so squared values <= 1.
-                # Raw voxel distances (~50 max) squared reach ~2500 without
-                # normalization, swamping all other losses at any hd_weight.
                 gt_dtm_np = compute_dtm(
                     label_batch[:labeled_bs].cpu().numpy(),
                     outputs[:labeled_bs, 0, ...].shape,
@@ -222,10 +225,8 @@ if __name__ == "__main__":
             # ------------------------------------------------------------------
             # Supervised losses (labeled samples only)
             # ------------------------------------------------------------------
-
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
 
-            # BCE at 0.5 weight: dense per-voxel gradient that supports Dice
             loss_seg = ce_loss(
                 outputs[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs].float())
@@ -233,9 +234,7 @@ if __name__ == "__main__":
                 outputs_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs] == 1)
 
-            # Boundary BCE with pos_weight to prevent all-background collapse.
-            # Boundary voxels ~1-3% of volume; without rebalancing the head
-            # finds it optimal to predict all-background (loss -> 0 trivially).
+            # Boundary BCE
             n_pos = gt_boundary.sum().clamp(min=1.0)
             n_neg = (1.0 - gt_boundary).sum()
             boundary_pos_weight = (n_neg / n_pos).clamp(max=50.0)
@@ -250,57 +249,48 @@ if __name__ == "__main__":
                 gt_dtm=gt_dtm,
                 one_side=True)
 
-            # Auxiliary deep supervision: Dice at mid-decoder resolution.
-            # Provides richer gradient signal to encoder from labeled samples.
             loss_aux = losses.dice_loss(
                 outputs_aux_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs] == 1)
 
             # ------------------------------------------------------------------
-            # Consistency losses (all samples: labeled + unlabeled)
+            # Consistency losses (all samples)
             # ------------------------------------------------------------------
-
             dis_to_mask = torch.sigmoid(-1500 * outputs_tanh)
 
-            # Boundary weight map: GT for labeled, self-predicted for unlabeled.
-            # Replaces flat ones-map so unlabeled samples also get boundary
-            # spatial emphasis near the regions the boundary head is confident.
-            with torch.no_grad():
-                boundary_pred_unlabeled = torch.sigmoid(
-                    outputs_boundary[labeled_bs:, 0, ...])
+            # --- FIX: Boundary Weight Map Construction ---
+            # Labeled: use GT boundary.
+            # Unlabeled: use ONES map (no bias). DO NOT use predicted boundary for weighting.
             boundary_weight_map = torch.cat(
-                [gt_boundary, boundary_pred_unlabeled], dim=0)
+                [gt_boundary, torch.ones_like(gt_boundary).repeat(batch_size - labeled_bs, 1, 1, 1)], dim=0)
 
+            # Adaptive DTC Loss (Simplified)
             consistency_loss = adaptive_dtc_loss(
                 dis_to_mask,
                 outputs_soft,
                 boundary_weight_map,
-                alpha=args.boundary_weight,
-                gamma=args.adtc_gamma)
+                alpha=args.boundary_weight)
 
-            # EMA mean teacher consistency — Dice loss against hard pseudo-labels.
-            #
-            # This is the EMA v1 formulation that produced the best result (89.82).
-            # The teacher's prediction is thresholded at 0.5 to create a hard
-            # pseudo-label, and the student is trained to match it via Dice loss.
-            #
-            # Why Dice and not MSE: the left atrium occupies ~30% of the volume.
-            # MSE treats every voxel equally, so 70% of the gradient comes from
-            # background voxels. Dice normalises by region size, giving foreground
-            # and background equal contribution regardless of class imbalance.
-            #
-            # Why hard labels and not soft: empirically, soft MSE + confidence
-            # masking performed worse (88.04 Dice vs 89.82 with hard Dice), likely
-            # because the confidence mask disproportionately removes foreground
-            # boundary voxels — the hardest and most informative voxels to learn.
+            # --- EMA Mean Teacher Consistency ---
             with torch.no_grad():
-                ema_tanh, ema_out, _, _ = ema_model(volume_batch[labeled_bs:])
+                ema_tanh, ema_out, ema_boundary, _ = ema_model(volume_batch[labeled_bs:])
                 ema_soft = torch.sigmoid(ema_out)
                 ema_pseudo = (ema_soft[:, 0, ...] > 0.5).float()
+                
+                # Boundary pseudo-labels from teacher
+                ema_boundary_prob = torch.sigmoid(ema_boundary)
 
-            loss_ema_consistency = losses.dice_loss(
+            # Segmentation Consistency (Dice on hard pseudo-labels)
+            loss_ema_seg = losses.dice_loss(
                 outputs_soft[labeled_bs:, 0, ...],
                 ema_pseudo)
+
+            # --- NEW: Boundary Consistency (MSE on soft pseudo-labels) ---
+            # Helps the boundary head learn on unlabeled data
+            loss_ema_boundary = F.mse_loss(
+                torch.sigmoid(outputs_boundary[labeled_bs:, 0, ...]),
+                ema_boundary_prob
+            )
 
             # ------------------------------------------------------------------
             # Total loss
@@ -318,8 +308,8 @@ if __name__ == "__main__":
 
             loss = (supervised_loss
                     + consistency_weight * consistency_loss
-                    + consistency_weight * args.ema_consistency_weight
-                    * loss_ema_consistency)
+                    + consistency_weight * args.ema_consistency_weight * loss_ema_seg
+                    + consistency_weight * 0.1 * loss_ema_boundary) # Small weight for boundary consistency
 
             optimizer.zero_grad()
             loss.backward()
@@ -340,69 +330,18 @@ if __name__ == "__main__":
             # ------------------------------------------------------------------
             writer.add_scalar('lr', lr_, iter_num)
             writer.add_scalar('loss/total', loss, iter_num)
-            writer.add_scalar('loss/seg_bce', loss_seg, iter_num)
             writer.add_scalar('loss/seg_dice', loss_seg_dice, iter_num)
             writer.add_scalar('loss/sdf', loss_sdf, iter_num)
             writer.add_scalar('loss/boundary', loss_boundary, iter_num)
             writer.add_scalar('loss/hd', loss_hd, iter_num)
-            writer.add_scalar('loss/aux', loss_aux, iter_num)
-            writer.add_scalar('loss/consistency_weight', consistency_weight,
-                              iter_num)
-            writer.add_scalar('loss/dtc_consistency', consistency_loss, iter_num)
-            writer.add_scalar('loss/ema_consistency', loss_ema_consistency,
-                              iter_num)
-
-            logging.info(
-                'iter %d : loss=%.4f  dice=%.4f  sdf=%.4f  bce=%.4f  '
-                'bnd=%.4f  hd=%.4f  aux=%.4f  dtc=%.4f  ema=%.4f  w=%.4f' % (
-                    iter_num, loss.item(), loss_seg_dice.item(),
-                    loss_sdf.item(), loss_seg.item(), loss_boundary.item(),
-                    loss_hd.item(), loss_aux.item(), consistency_loss.item(),
-                    loss_ema_consistency.item(), consistency_weight))
+            writer.add_scalar('loss/consistency_dtc', consistency_loss, iter_num)
+            writer.add_scalar('loss/ema_seg', loss_ema_seg, iter_num)
+            writer.add_scalar('loss/ema_boundary', loss_ema_boundary, iter_num)
 
             if iter_num % 50 == 0:
-                img = volume_batch[0, 0:1, :, :, 20:61:10].permute(
-                    3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Image',
-                                 make_grid(img, 5, normalize=True), iter_num)
+                # Optional: Add logging images here as in original script
+                pass
 
-                img = outputs_soft[0, 0:1, :, :, 20:61:10].permute(
-                    3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Predicted_label',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = dis_to_mask[0, 0:1, :, :, 20:61:10].permute(
-                    3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Dis2Mask',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = label_batch[0, :, :, 20:61:10].unsqueeze(
-                    0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Groundtruth_label',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = gt_dis[0, :, :, 20:61:10].unsqueeze(
-                    0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Groundtruth_DistMap',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = torch.sigmoid(
-                    outputs_boundary[0, 0:1, :, :, 20:61:10]).permute(
-                    3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Predicted_boundary',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = gt_boundary[0, :, :, 20:61:10].unsqueeze(
-                    0).permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/Groundtruth_boundary',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-                img = ema_soft[0, 0:1, :, :, 20:61:10].permute(
-                    3, 0, 1, 2).repeat(1, 3, 1, 1)
-                writer.add_image('train/EMA_teacher_pred',
-                                 make_grid(img, 5, normalize=False), iter_num)
-
-            # Learning rate decay — same two-step schedule as original DTC
             if iter_num % 2500 == 0:
                 lr_ = base_lr * 0.1 ** (iter_num // 2500)
                 for param_group in optimizer.param_groups:
