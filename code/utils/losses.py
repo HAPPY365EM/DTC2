@@ -140,13 +140,10 @@ def entropy_map(p):
 def compute_boundary_gt(label_batch_np):
     """
     Derive a binary boundary map from a batch of segmentation masks.
-
     Args:
-        label_batch_np (np.ndarray): integer masks, shape (B, H, W, D).
-
+        label_batch_np (np.ndarray): shape (B, H, W, D), values in {0, 1}.
     Returns:
-        boundary_gt (np.ndarray): float32 boundary map, shape (B, H, W, D),
-            values in {0.0, 1.0}.
+        boundary_gt (np.ndarray): float32, shape (B, H, W, D), values {0, 1}.
     """
     boundary_gt = np.zeros_like(label_batch_np, dtype=np.float32)
     for b in range(label_batch_np.shape[0]):
@@ -165,39 +162,27 @@ def compute_boundary_gt(label_batch_np):
 def adaptive_dtc_loss(dis_to_mask, outputs_soft, boundary_weight_map,
                       alpha=0.3, gamma=0.5):
     """
-    Extended DTC consistency loss combining curriculum weighting and boundary
-    spatial emphasis:
+    Extended DTC consistency loss:
 
         L = mean( W(x) * S(x) * (dis_to_mask(x) - outputs_soft(x))^2 )
 
     W(x) = exp(-gamma * |dis_to_mask(x) - outputs_soft(x)|)
-        Curriculum weighting: voxels where the two tasks agree receive W ≈ 1
-        (full consistency pressure). Voxels with high disagreement — typically
-        uncertain boundary regions early in training — receive lower weight,
-        softening the gradient until the supervised loss has built a stable
-        representation. This is the same principle as UA-MT's uncertainty
-        masking. W is computed with .detach() so it does not accumulate its
-        own gradients.
-
-        NOTE: an earlier version of this file incorrectly removed W, reasoning
-        that it "down-weights boundary voxels". That reasoning confused effect
-        with intent. W down-weights UNCERTAIN voxels early in training, which
-        is the desired curriculum — not a sign error. Removing W forced full
-        consistency gradients on uncertain boundaries from iteration 1 and
-        caused HD95 to regress from ~7 to ~18 voxels across multiple runs.
+        Voxels where the two tasks already agree receive W ≈ 1 (full pressure).
+        Voxels with high disagreement receive lower weight, softening the
+        gradient where the model is uncertain. W is detached so it acts as a
+        data-dependent coefficient and does not accumulate its own gradients.
 
     S(x) = alpha * B(x) + (1 - alpha)
-        Boundary spatial emphasis: amplifies consistency pressure near surfaces
-        to target ASD and 95HD directly. B(x) is the GT boundary map for
-        labeled samples and the boundary-head prediction for unlabeled samples.
+        Boundary spatial emphasis. B(x) is the GT boundary map for labeled
+        samples and the boundary-head prediction for unlabeled samples.
 
     Args:
-        dis_to_mask (Tensor): sigmoid(-1500 * out_tanh),
-            shape (B, 1, H, W, D) or (B, H, W, D).
+        dis_to_mask (Tensor): sigmoid(-1500 * out_tanh), shape (B,1,H,W,D)
+            or (B,H,W,D).
         outputs_soft (Tensor): sigmoid(out_seg), same shape as dis_to_mask.
-        boundary_weight_map (Tensor): float32 boundary map, shape (B, H, W, D).
+        boundary_weight_map (Tensor): float32 boundary map, shape (B,H,W,D).
         alpha (float): boundary emphasis strength. Default 0.3.
-        gamma (float): curriculum sharpness. Default 0.5.
+        gamma (float): weighting sharpness. Default 0.5.
 
     Returns:
         loss (Tensor): scalar.
@@ -209,10 +194,8 @@ def adaptive_dtc_loss(dis_to_mask, outputs_soft, boundary_weight_map,
 
     diff = dis_to_mask - outputs_soft
 
-    # Curriculum weighting — detached so W is not trained through
     W = torch.exp(-gamma * torch.abs(diff.detach()))
-
-    # Boundary spatial emphasis
     S = alpha * boundary_weight_map + (1.0 - alpha)
 
-    return torch.mean(W * S * diff ** 2)
+    loss = torch.mean(W * S * diff ** 2)
+    return loss
