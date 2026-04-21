@@ -58,7 +58,7 @@ parser.add_argument('--consistency_rampup', type=float, default=40.0,
 parser.add_argument('--boundary_weight', type=float, default=0.3,
                     help='alpha: boundary spatial emphasis in adaptive DTC loss')
 parser.add_argument('--adtc_gamma', type=float, default=0.5,
-                    help='gamma: task-agreement curriculum weighting sharpness')
+                    help='gamma: task-agreement weighting sharpness')
 parser.add_argument('--hd_weight', type=float, default=0.1,
                     help='weight for Hausdorff distance loss')
 parser.add_argument('--ema_decay', type=float, default=0.99,
@@ -121,32 +121,6 @@ if __name__ == "__main__":
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
-    # ------------------------------------------------------------------
-    # EMA teacher dropout: BOTH models keep has_dropout=True.
-    #
-    # An earlier version of this code set has_dropout=False for the EMA
-    # teacher, reasoning that a deterministic teacher gives more stable
-    # pseudo-labels. That reasoning is correct in the classical Mean
-    # Teacher setting, but it was harmful here for the following reason:
-    #
-    # Early in training (iterations 0-1000) the EMA teacher's weights are
-    # essentially a noisy copy of the randomly-initialised student.
-    # With dropout ACTIVE, the teacher's predictions collapse to near-zero
-    # probability for most voxels, so threshold(teacher > 0.5) ≈ all-zeros,
-    # and dice_loss(student_pred, all_zeros) ≈ 1.0 — a constant.  A constant
-    # loss has zero gradient, which means the EMA consistency term is
-    # effectively disabled in early training.  This is a natural curriculum:
-    # the EMA term self-activates only once the teacher has learned something
-    # useful from the supervised signal.
-    #
-    # With a deterministic teacher (no dropout), the teacher produces
-    # consistent but wrong predictions early on, injecting a persistent
-    # incorrect gradient signal onto unlabeled data from iteration 1.
-    # This degraded HD95 from 6.87 to ~18 across three experiment runs.
-    #
-    # Restoring has_dropout=True for both models reproduces the beneficial
-    # natural curriculum that the original 89.82 run relied upon.
-    # ------------------------------------------------------------------
     def create_model(ema=False):
         net = VNet(n_channels=1, n_classes=num_classes - 1,
                    normalization='batchnorm', has_dropout=True)
@@ -207,19 +181,14 @@ if __name__ == "__main__":
             volume_batch, label_batch = (volume_batch.cuda(),
                                          label_batch.cuda())
 
-            # Student forward pass — 4 outputs
             outputs_tanh, outputs, outputs_boundary, outputs_aux = \
                 model(volume_batch)
             outputs_soft = torch.sigmoid(outputs)
 
-            # Upsample auxiliary output (56×56×40) → full patch (112×112×80)
             outputs_aux_up   = F.interpolate(outputs_aux, size=patch_size,
                                              mode='trilinear', align_corners=False)
             outputs_aux_soft = torch.sigmoid(outputs_aux_up)
 
-            # ------------------------------------------------------------------
-            # Ground-truth preparation (no gradient)
-            # ------------------------------------------------------------------
             with torch.no_grad():
                 gt_dis = compute_sdf(
                     label_batch[:labeled_bs].cpu().numpy(),
@@ -236,10 +205,6 @@ if __name__ == "__main__":
                     normalize=True)
                 gt_dtm = torch.from_numpy(gt_dtm_np).float().cuda()
 
-            # ------------------------------------------------------------------
-            # Supervised losses (labeled samples only)
-            # ------------------------------------------------------------------
-
             loss_sdf = mse_loss(outputs_tanh[:labeled_bs, 0, ...], gt_dis)
 
             loss_seg = ce_loss(
@@ -249,7 +214,6 @@ if __name__ == "__main__":
                 outputs_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs] == 1)
 
-            # Boundary BCE with pos_weight to prevent all-background collapse.
             n_pos = gt_boundary.sum().clamp(min=1.0)
             n_neg = (1.0 - gt_boundary).sum()
             boundary_pos_weight = (n_neg / n_pos).clamp(max=50.0)
@@ -268,24 +232,14 @@ if __name__ == "__main__":
                 outputs_aux_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs] == 1)
 
-            # ------------------------------------------------------------------
-            # Consistency losses (labeled + unlabeled)
-            # ------------------------------------------------------------------
-
             dis_to_mask = torch.sigmoid(-1500 * outputs_tanh)
 
-            # Boundary weight map: GT for labeled, boundary-head prediction
-            # for unlabeled.
             with torch.no_grad():
                 boundary_pred_unlabeled = torch.sigmoid(
                     outputs_boundary[labeled_bs:, 0, ...])
             boundary_weight_map = torch.cat(
                 [gt_boundary, boundary_pred_unlabeled], dim=0)
 
-            # adaptive_dtc_loss: curriculum weighting W combined with
-            # boundary spatial emphasis S.  W = exp(-gamma*|diff|) softens
-            # consistency on uncertain voxels early in training (analogous to
-            # UA-MT uncertainty masking).  S amplifies pressure near surfaces.
             consistency_loss = adaptive_dtc_loss(
                 dis_to_mask,
                 outputs_soft,
@@ -293,9 +247,6 @@ if __name__ == "__main__":
                 alpha=args.boundary_weight,
                 gamma=args.adtc_gamma)
 
-            # EMA consistency: Dice against teacher's hard pseudo-labels.
-            # Both teacher and student have dropout active, so the teacher's
-            # predictions are stochastic — see the create_model note above.
             with torch.no_grad():
                 ema_tanh, ema_out, _, _ = ema_model(volume_batch[labeled_bs:])
                 ema_soft   = torch.sigmoid(ema_out)
@@ -305,9 +256,6 @@ if __name__ == "__main__":
                 outputs_soft[labeled_bs:, 0, ...],
                 ema_pseudo)
 
-            # ------------------------------------------------------------------
-            # Total loss
-            # ------------------------------------------------------------------
             supervised_loss = (
                 0.5 * loss_seg
                 + loss_seg_dice
@@ -317,13 +265,7 @@ if __name__ == "__main__":
                 + args.aux_weight * loss_aux
             )
 
-            # Rampup: maps [0, max_iterations] → [0, consistency_rampup]
-            # continuously.  Mathematically equivalent to the original
-            # iter_num // 150 (= iter_num / (6000/40)) but dataset-size-
-            # independent and avoids the floor artefact at iteration
-            # boundaries.
-            virtual_epoch      = iter_num / max_iterations * args.consistency_rampup
-            consistency_weight = get_current_consistency_weight(virtual_epoch)
+            consistency_weight = get_current_consistency_weight(iter_num // 150)
 
             loss = (supervised_loss
                     + consistency_weight * consistency_loss
@@ -344,9 +286,6 @@ if __name__ == "__main__":
 
             iter_num += 1
 
-            # ------------------------------------------------------------------
-            # Logging
-            # ------------------------------------------------------------------
             writer.add_scalar('lr', lr_, iter_num)
             writer.add_scalar('loss/total', loss, iter_num)
             writer.add_scalar('loss/seg_bce', loss_seg, iter_num)
