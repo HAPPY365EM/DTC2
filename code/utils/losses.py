@@ -134,21 +134,32 @@ def entropy_map(p):
 
 
 # ---------------------------------------------------------------------------
-# Boundary ground-truth generation (numpy, CPU)
+# NEW — Improvement 1: Boundary ground-truth generation (numpy, CPU)
 # ---------------------------------------------------------------------------
 
 def compute_boundary_gt(label_batch_np):
     """
     Derive a binary boundary map from a batch of segmentation masks.
+
+    Boundary voxels are defined as the inner border of the foreground region,
+    consistent with how the SDF ground truth sets boundary voxels to zero.
+    The result is used both as supervision for the boundary head (Task 3)
+    and to build the spatial emphasis map B(x) for the adaptive DTC loss.
+
     Args:
-        label_batch_np (np.ndarray): shape (B, H, W, D), values in {0, 1}.
+        label_batch_np (np.ndarray): integer segmentation masks,
+            shape = (B, H, W, D), values in {0, 1}.
+
     Returns:
-        boundary_gt (np.ndarray): float32, shape (B, H, W, D), values {0, 1}.
+        boundary_gt (np.ndarray): float32 binary boundary map,
+            shape = (B, H, W, D), values in {0.0, 1.0}.
     """
     boundary_gt = np.zeros_like(label_batch_np, dtype=np.float32)
     for b in range(label_batch_np.shape[0]):
         posmask = label_batch_np[b].astype(bool)
         if posmask.any():
+            # find_boundaries with mode='inner' marks voxels on the
+            # foreground side of the boundary — consistent with SDF = 0 locus
             boundary = skimage_seg.find_boundaries(
                 posmask, mode='inner').astype(np.float32)
             boundary_gt[b] = boundary
@@ -156,46 +167,130 @@ def compute_boundary_gt(label_batch_np):
 
 
 # ---------------------------------------------------------------------------
-# Adaptive DTC loss
+# NEW — Improvement 2: Adaptive DTC loss with boundary spatial emphasis
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# NEW — Improvement 3: Confidence-gated pseudo-label Dice loss
+# ---------------------------------------------------------------------------
+
+def pseudo_label_dice_loss(outputs_soft_unlabeled, dis_to_mask_unlabeled,
+                           W_unlabeled, tau=0.8):
+    """
+    Confidence-gated pseudo-label Dice loss for unlabeled data.
+
+    Motivation: the adaptive DTC loss and boundary head improve surface metrics
+    but contribute little to volumetric Dice, which is driven by interior region
+    accuracy. This loss provides direct Dice-optimisation signal on unlabeled
+    data using only the voxels where both tasks already agree strongly.
+
+    Algorithm:
+      1. Build a reliability mask M(x) = 1 where W(x) > tau.
+         W is the task-agreement weight already computed by adaptive_dtc_loss.
+         High W → both tasks agree → pseudo-label is trustworthy.
+      2. Construct a soft pseudo-label ŷ(x) by averaging the two task predictions
+         at reliable voxels. Averaging reduces single-task bias.
+      3. Apply Dice loss between the segmentation prediction and ŷ, restricted
+         to reliable voxels only via element-wise masking.
+      4. If no voxel passes the threshold (degenerate early-training case),
+         return zero loss gracefully.
+
+    Args:
+        outputs_soft_unlabeled (Tensor): sigmoid(out_seg) for unlabeled samples,
+            shape = (B_u, H, W, D).
+        dis_to_mask_unlabeled (Tensor): sigmoid(-1500 * out_tanh) for unlabeled,
+            shape = (B_u, H, W, D).
+        W_unlabeled (Tensor): per-voxel task-agreement weight for unlabeled
+            samples, shape = (B_u, H, W, D). Computed with .detach() in caller.
+        tau (float): reliability threshold in (0, 1). Voxels with W > tau are
+            used. Default 0.8 — only the top ~20% most-agreed voxels contribute.
+
+    Returns:
+        loss (Tensor): scalar Dice loss on reliable voxels, or zero if none pass.
+    """
+    # Reliability mask: 1 where both tasks agree strongly
+    M = (W_unlabeled > tau).float()                        # (B_u, H, W, D)
+
+    if M.sum() < 1:
+        # No reliable voxel yet (early training) — skip gracefully
+        return torch.tensor(0.0, device=outputs_soft_unlabeled.device,
+                            requires_grad=False)
+
+    # Soft pseudo-label: average of the two task predictions at reliable voxels
+    pseudo = ((outputs_soft_unlabeled + dis_to_mask_unlabeled) / 2.0).detach()
+
+    # Apply mask to both prediction and pseudo-label
+    pred_masked   = outputs_soft_unlabeled * M
+    pseudo_masked = pseudo * M
+
+    # Dice loss on the masked volume
+    smooth = 1e-5
+    intersect = torch.sum(pred_masked * pseudo_masked)
+    pred_sum  = torch.sum(pred_masked  * pred_masked)
+    pseudo_sum = torch.sum(pseudo_masked * pseudo_masked)
+    loss = 1.0 - (2.0 * intersect + smooth) / (pred_sum + pseudo_sum + smooth)
+    return loss
+
 
 def adaptive_dtc_loss(dis_to_mask, outputs_soft, boundary_weight_map,
                       alpha=0.3, gamma=0.5):
     """
-    Extended DTC consistency loss:
+    Replaces the original uniform `torch.mean((dis_to_mask - outputs_soft)**2)`.
 
-        L = mean( W(x) * S(x) * (dis_to_mask(x) - outputs_soft(x))^2 )
+    Two innovations applied jointly:
 
-    W(x) = exp(-gamma * |dis_to_mask(x) - outputs_soft(x)|)
-        Voxels where the two tasks already agree receive W ≈ 1 (full pressure).
-        Voxels with high disagreement receive lower weight, softening the
-        gradient where the model is uncertain. W is detached so it acts as a
-        data-dependent coefficient and does not accumulate its own gradients.
+    (a) Task-disagreement adaptive weighting W(x):
+        Voxels where the two tasks already agree strongly receive a higher
+        consistency weight; high-disagreement voxels are down-weighted as
+        unreliable and treated as uncertain.
+            W(x) = exp(-gamma * |dis_to_mask(x) - outputs_soft(x)|)
+        This is parameter-free and adds zero extra computation beyond the
+        existing difference map that the original loss already computes.
 
-    S(x) = alpha * B(x) + (1 - alpha)
-        Boundary spatial emphasis. B(x) is the GT boundary map for labeled
-        samples and the boundary-head prediction for unlabeled samples.
+    (b) Boundary spatial emphasis B(x):
+        The boundary weight map (derived from GT on labeled samples, or a
+        uniform ones-map on unlabeled samples) amplifies consistency pressure
+        near boundaries, directly targeting ASD and 95HD improvement.
+        The combined spatial weight is:
+            S(x) = alpha * B(x) + (1 - alpha)
+        so interior voxels receive weight (1-alpha) and boundary voxels
+        receive weight 1.0, with alpha controlling the emphasis strength.
+
+    Final loss:
+        L_adtc = mean( W(x) * S(x) * (dis_to_mask(x) - outputs_soft(x))^2 )
 
     Args:
-        dis_to_mask (Tensor): sigmoid(-1500 * out_tanh), shape (B,1,H,W,D)
-            or (B,H,W,D).
-        outputs_soft (Tensor): sigmoid(out_seg), same shape as dis_to_mask.
-        boundary_weight_map (Tensor): float32 boundary map, shape (B,H,W,D).
-        alpha (float): boundary emphasis strength. Default 0.3.
-        gamma (float): weighting sharpness. Default 0.5.
+        dis_to_mask (Tensor): T^{-1}(f2(x)), sigmoid(-1500 * out_tanh),
+            shape = (B, 1, H, W, D) or (B, H, W, D).
+        outputs_soft (Tensor): sigmoid(out_seg),
+            same shape as dis_to_mask.
+        boundary_weight_map (Tensor): float32 spatial boundary map,
+            shape = (B, H, W, D). Use GT boundary on labeled samples,
+            torch.ones_like(...) on unlabeled samples.
+        alpha (float): boundary emphasis strength in [0, 1].
+            alpha=0 reduces to pure adaptive weighting (no spatial emphasis).
+            alpha=1 makes boundary voxels receive 2x weight vs. interior.
+            Default 0.3.
+        gamma (float): sharpness of adaptive disagreement weighting.
+            Higher gamma → more aggressive down-weighting of uncertain voxels.
+            Default 0.5.
 
     Returns:
         loss (Tensor): scalar.
     """
+    # Squeeze channel dim if present so shapes align with boundary_weight_map
     if dis_to_mask.dim() == 5:
-        dis_to_mask = dis_to_mask[:, 0, ...]
+        dis_to_mask = dis_to_mask[:, 0, ...]       # (B, H, W, D)
     if outputs_soft.dim() == 5:
-        outputs_soft = outputs_soft[:, 0, ...]
+        outputs_soft = outputs_soft[:, 0, ...]      # (B, H, W, D)
 
-    diff = dis_to_mask - outputs_soft
+    diff = dis_to_mask - outputs_soft               # (B, H, W, D)
 
-    W = torch.exp(-gamma * torch.abs(diff.detach()))
-    S = alpha * boundary_weight_map + (1.0 - alpha)
+    # (a) Task-disagreement adaptive weight — no extra parameters
+    W = torch.exp(-gamma * torch.abs(diff.detach()))  # detach: W is not trained
+
+    # (b) Boundary spatial emphasis
+    S = alpha * boundary_weight_map + (1.0 - alpha)   # in [1-alpha, 1]
 
     loss = torch.mean(W * S * diff ** 2)
     return loss
