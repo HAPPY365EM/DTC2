@@ -4,20 +4,12 @@ import torch.nn.functional as F
 
 """
 Modified VNet with four output heads:
-  - out_tanh    : SDF/LSF regression head (Task 2), output in [-1, 1].
-                  Implemented via out_conv + Tanh in the decoder.
-  - out_seg     : pixel-wise segmentation head (Task 1), raw logits.
-                  Implemented via out_conv2 in the decoder.
-  - out_boundary: lightweight boundary prediction head (Task 3), raw logits.
+  - out_tanh    : SDF/LSF regression head (Task 2), output in [-1, 1]
+  - out_seg     : pixel-wise segmentation head (Task 1), raw logits
+  - out_boundary: lightweight boundary prediction head (Task 3), raw logits
   - out_aux     : auxiliary deep supervision head at half spatial resolution,
                   attached to x7_up (56x56x40). Upsampled to full resolution
                   in the training loop for loss computation. Discarded at inference.
-
-Head-to-layer mapping (decoder output names match __init__ layer names):
-    out_tanh     ← self.tanh(self.out_conv(x9))    Task 2: SDF regression
-    out_seg      ← self.out_conv2(x9)              Task 1: seg logits
-    out_boundary ← self.out_conv3(x9)              Task 3: boundary logits
-    out_aux      ← self.out_conv_aux(x7_up)        Aux:    mid-decoder Dice
 """
 
 
@@ -184,27 +176,15 @@ class VNet(nn.Module):
         self.block_nine = convBlock(1, n_filters, n_filters,
                                     normalization=normalization)
 
-        # FIX: comments below now match actual usage in decoder().
-        # Previously out_conv was documented as "Task 1: segmentation" but was
-        # actually used with Tanh for SDF (Task 2), and out_conv2 was documented
-        # as "Task 2: SDF" but used for segmentation logits (Task 1).
-        # The weights themselves are unchanged — only the comments are corrected.
-
-        # Task 2: SDF/LSF regression head — reads from x9, output passed through
-        # Tanh in decoder() to produce values in [-1, 1].
+        # Task 1: pixel-wise segmentation head (raw logits) — reads from x9 (16ch)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
-
-        # Task 1: pixel-wise segmentation head — reads from x9, outputs raw logits.
-        # Apply sigmoid externally (e.g. torch.sigmoid(out_seg)) for probabilities.
+        # Task 2: SDF/LSF regression head (output passed through Tanh) — reads from x9
         self.out_conv2 = nn.Conv3d(n_filters, n_classes, 1, padding=0)
-
-        # Task 3: boundary prediction head — reads from x9, single channel,
-        # raw logits. Apply sigmoid externally for boundary probabilities.
+        # Task 3: boundary prediction head (single channel) — reads from x9
         self.out_conv3 = nn.Conv3d(n_filters, 1, 1, padding=0)
-
-        # Auxiliary deep supervision head — reads from x7_up (n_filters*2 channels)
-        # at half spatial resolution (56x56x40). Upsampled to full resolution in the
-        # training loop before computing Dice loss. Discarded at inference time.
+        # Auxiliary deep supervision head — reads from x7_up (32ch = n_filters*2).
+        # Produces logits at half spatial resolution; upsampled in training loop.
+        # Discarded at inference. Adds only n_filters*2 * n_classes weights.
         self.out_conv_aux = nn.Conv3d(n_filters * 2, n_classes, 1, padding=0)
 
         self.tanh = nn.Tanh()
@@ -246,7 +226,7 @@ class VNet(nn.Module):
 
         # Auxiliary deep supervision output at half resolution.
         # Applied before block_eight so it captures mid-decoder semantics.
-        out_aux = self.out_conv_aux(x7_up)    # (B, n_classes, 56, 56, 40)
+        out_aux = self.out_conv_aux(x7_up)   # (B, n_classes, 56, 56, 40)
 
         x8 = self.block_eight(x7_up)
         x8_up = self.block_eight_up(x8)
@@ -256,13 +236,10 @@ class VNet(nn.Module):
         if self.has_dropout:
             x9 = self.dropout(x9)
 
-        # All three full-resolution heads share x9.
-        # out_conv  → Tanh  → Task 2: SDF in [-1, 1]
-        # out_conv2 →       → Task 1: segmentation logits (sigmoid externally)
-        # out_conv3 →       → Task 3: boundary logits (sigmoid externally)
-        out_tanh     = self.tanh(self.out_conv(x9))   # Task 2: SDF [-1, 1]
-        out_seg      = self.out_conv2(x9)             # Task 1: seg logits
-        out_boundary = self.out_conv3(x9)             # Task 3: boundary logits
+        # All three full-resolution heads share x9
+        out_tanh = self.tanh(self.out_conv(x9))    # Task 2: SDF in [-1, 1]
+        out_seg = self.out_conv2(x9)               # Task 1: seg logits
+        out_boundary = self.out_conv3(x9)          # Task 3: boundary logits
 
         return out_tanh, out_seg, out_boundary, out_aux
 
@@ -284,9 +261,9 @@ if __name__ == '__main__':
                  has_dropout=False)
     input = torch.randn(2, 1, 112, 112, 80)
     out_tanh, out_seg, out_boundary, out_aux = model(input)
-    print("out_tanh shape:    ", out_tanh.shape)     # Task 2: SDF
-    print("out_seg shape:     ", out_seg.shape)      # Task 1: seg logits
-    print("out_boundary shape:", out_boundary.shape) # Task 3: boundary logits
-    print("out_aux shape:     ", out_aux.shape)      # Aux: mid-decoder
+    print("out_tanh shape:    ", out_tanh.shape)
+    print("out_seg shape:     ", out_seg.shape)
+    print("out_boundary shape:", out_boundary.shape)
+    print("out_aux shape:     ", out_aux.shape)
     print("VNet have {} parameters in total".format(
         sum(x.numel() for x in model.parameters())))
