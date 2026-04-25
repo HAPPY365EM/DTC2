@@ -110,24 +110,24 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
                     np.expand_dims(test_patch, axis=0), axis=0).astype(np.float32)
                 test_patch = torch.from_numpy(test_patch).cuda()
 
-                # Test-time augmentation: average predictions over all 8
-                # flip combinations (2^3 across the W, H, D spatial axes).
-                # Each patch is flipped before inference and flipped back
-                # before accumulation, so all 8 views are in the same space.
-                # Seg and SDF heads are ensembled within each augmentation.
-                # TTA adds ~8x inference time per patch but zero training cost.
+                # Test-time augmentation: average predictions over 4 flip
+                # combinations across the W (axis 2) and H (axis 3) axes only.
+                #
+                # IMPORTANT: D-axis (axis 4) flips are intentionally excluded.
+                # RandomRotFlip during training only flips W (axis 0) or H
+                # (axis 1) of the 3D image — it never flips D. Including D-axis
+                # flips at test time creates out-of-distribution inputs that the
+                # network has never seen, producing garbage predictions that
+                # drag the ensemble average below the single-pass baseline.
+                # TTA augmentations must be a subset of training augmentations.
                 y_tta = torch.zeros(
                     1, num_classes, *test_patch.shape[2:],
                     device=test_patch.device)
                 flip_axes_list = [
                     [],        # original
-                    [2],       # flip W
-                    [3],       # flip H
-                    [4],       # flip D
-                    [2, 3],    # flip W+H
-                    [2, 4],    # flip W+D
-                    [3, 4],    # flip H+D
-                    [2, 3, 4], # flip W+H+D
+                    [2],       # flip W  — seen during training
+                    [3],       # flip H  — seen during training
+                    [2, 3],    # flip W+H — seen during training
                 ]
                 with torch.no_grad():
                     for flip_axes in flip_axes_list:
