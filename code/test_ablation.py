@@ -118,9 +118,13 @@ def _forward(net, patch, use_4head, use_ensemble):
         # The SDF output is negated before sigmoid so that interior voxels
         # (negative SDF) map to high probability, matching the seg head.
         prob_sdf = torch.sigmoid(-1500 * y_tanh)   # Task 2 probability
-        return 0.5 * prob_seg + 0.5 * prob_sdf
+        prob = 0.5 * prob_seg + 0.5 * prob_sdf
     else:
-        return prob_seg
+        prob = prob_seg
+
+    # Remove the batch dimension: (1, C, H, W, D) → (C, H, W, D)
+    # so that prob_final aligns with score_map shape (num_classes, H, W, D).
+    return prob[0]
 
 
 def test_single_case(net, image, stride_xy, stride_z, patch_size,
@@ -180,9 +184,11 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size,
 
                 with torch.no_grad():
                     if use_tta:
-                        # 4-fold TTA: average over flip augmentations
+                        # 4-fold TTA: average over flip augmentations.
+                        # acc shape: (num_classes, H, W, D) — batch dim already
+                        # removed by _forward, so we allocate without it.
                         acc = torch.zeros(
-                            1, num_classes, *patch_t.shape[2:],
+                            num_classes, *patch_t.shape[2:],
                             device=patch_t.device)
                         for flip_axes in TTA_FLIP_AXES:
                             aug = (torch.flip(patch_t, flip_axes)
