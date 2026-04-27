@@ -1,20 +1,12 @@
 """
-test_ablation.py — Unified test script for ablation variants M0 – M5.
+test_ablation.py — Unified test script for ablation variants M0 – M4.
 
-Variant differences at inference
-----------------------------------
-M0          2-head VNet | single forward pass | seg head only
-M1 – M4     4-head VNet | single forward pass | seg head only
-M5          4-head VNet | 4-fold TTA          | dual-head ensemble
-              (uses M4 checkpoint; only inference differs)
+All variants are evaluated under the same inference protocol:
+    - 4‑fold test‑time augmentation (TTA)
+    - Dual‑head ensemble (segmentation probability + SDF‑derived probability)
 
-Usage examples
---------------
-# Test M0
-python test_ablation.py --variant M0 --model_path ../model/.../iter_6000.pth
-
-# Test M5 (using M4 checkpoint)
-python test_ablation.py --variant M5 --model_path ../model/.../iter_6000.pth
+Differences among variants are only in the trained model weights (number of
+heads, training components). The evaluation protocol remains identical.
 """
 
 import argparse
@@ -31,18 +23,11 @@ from skimage.measure import label
 from tqdm import tqdm
 
 # =============================================================================
-# Variant flags (mirrors train_ablation.py)
+# Fixed inference settings
 # =============================================================================
 
-VARIANT_FLAGS = {
-    'M0': dict(use_4head=False, use_tta=False, use_ensemble=False),
-    'M1': dict(use_4head=True,  use_tta=False, use_ensemble=False),
-    'M2': dict(use_4head=True,  use_tta=False, use_ensemble=False),
-    'M3': dict(use_4head=True,  use_tta=False, use_ensemble=False),
-    'M4': dict(use_4head=True,  use_tta=False, use_ensemble=False),
-    # M5 = M4 weights + TTA + dual-head ensemble at inference
-    'M5': dict(use_4head=True,  use_tta=True,  use_ensemble=True),
-}
+USE_TTA      = True   # 4‑fold flip TTA (W and H axes only)
+USE_ENSEMBLE = True   # blend seg and SDF heads
 
 # TTA flip combinations — W and H axes only (D excluded; see test_util.py for rationale)
 TTA_FLIP_AXES = [
@@ -53,12 +38,25 @@ TTA_FLIP_AXES = [
 ]
 
 # =============================================================================
+# Variant → model architecture mapping
+# =============================================================================
+
+# Only need to know whether the model has 2 or 4 outputs
+USE_4HEAD_MAP = {
+    'M0': False,
+    'M1': True,
+    'M2': True,
+    'M3': True,
+    'M4': True,
+}
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--variant', type=str, default='M5',
-                    choices=list(VARIANT_FLAGS.keys()))
+parser.add_argument('--variant', type=str, default='M4',
+                    choices=['M0', 'M1', 'M2', 'M3', 'M4'])
 parser.add_argument('--model_path', type=str, required=True,
                     help='Path to saved model checkpoint (.pth)')
 parser.add_argument('--root_path', type=str,
@@ -76,6 +74,9 @@ parser.add_argument('--nms', type=int, default=0,
                     help='Apply largest-connected-component post-processing')
 parser.add_argument('--gpu', type=str, default='0')
 args = parser.parse_args()
+
+# Derived
+USE_4HEAD = USE_4HEAD_MAP[args.variant]
 
 # =============================================================================
 # Utilities
@@ -101,48 +102,38 @@ def calculate_metric_percase(pred, gt):
 # Core inference — one 3D volume
 # =============================================================================
 
-def _forward(net, patch, use_4head, use_ensemble):
+def _forward_single(net, patch, use_4head):
     """
-    Single forward pass on a 5D patch (1,1,H,W,D).
-    Returns a probability map tensor of shape (1, H, W, D).
+    Single forward pass (no TTA). Returns a probability map of shape (1, H, W, D).
     """
     if use_4head:
         y_tanh, y_seg, _, _ = net(patch)
     else:
         y_tanh, y_seg = net(patch)
 
-    prob_seg = torch.sigmoid(y_seg)       # Task 1 probability
+    prob_seg = torch.sigmoid(y_seg)                     # (1, 1, H, W, D)
+    prob_sdf = torch.sigmoid(-1500 * y_tanh)            # (1, 1, H, W, D)
 
-    if use_ensemble:
-        # Dual-head ensemble: average seg and SDF-derived probabilities.
-        # The SDF output is negated before sigmoid so that interior voxels
-        # (negative SDF) map to high probability, matching the seg head.
-        prob_sdf = torch.sigmoid(-1500 * y_tanh)   # Task 2 probability
+    if USE_ENSEMBLE:
         prob = 0.5 * prob_seg + 0.5 * prob_sdf
     else:
         prob = prob_seg
-
-    # Remove the batch dimension: (1, C, H, W, D) → (C, H, W, D)
-    # so that prob_final aligns with score_map shape (num_classes, H, W, D).
-    return prob[0]
+    return prob   # (1, 1, H, W, D)
 
 
 def test_single_case(net, image, stride_xy, stride_z, patch_size,
-                     num_classes=1, use_4head=False,
-                     use_tta=False, use_ensemble=False):
+                     num_classes=1, use_4head=False):
     """
-    Sliding-window inference over one volume.
+    Sliding‑window inference over one volume with TTA + dual‑head ensemble.
 
     Args:
         net         : trained model in eval mode.
         image       : numpy array (W, H, D).
-        stride_xy   : sliding-window stride in W/H dimensions.
-        stride_z    : sliding-window stride in D dimension.
+        stride_xy   : sliding‑window stride in W/H dimensions.
+        stride_z    : sliding‑window stride in D dimension.
         patch_size  : (W, H, D) tuple.
         num_classes : number of foreground classes (1 for binary).
-        use_4head   : True for 4-output network (M1-M5), False for M0.
-        use_tta     : enable 4-fold flip TTA (M5 only).
-        use_ensemble: blend seg + SDF-derived probabilities (M5 only).
+        use_4head   : True for 4‑output network, False for 2‑head.
 
     Returns:
         label_map  (np.ndarray): binary prediction, shape (W, H, D).
@@ -183,26 +174,23 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size,
                     patch_np[None, None].astype(np.float32)).cuda()
 
                 with torch.no_grad():
-                    if use_tta:
-                        # 4-fold TTA: average over flip augmentations.
-                        # acc shape: (num_classes, H, W, D) — batch dim already
-                        # removed by _forward, so we allocate without it.
-                        acc = torch.zeros(
-                            num_classes, *patch_t.shape[2:],
-                            device=patch_t.device)
+                    if USE_TTA:
+                        # 4‑fold TTA: average over flip augmentations.
+                        # acc shape: (1, 1, H, W, D) — matches _forward_single output.
+                        acc = torch.zeros(1, 1, *patch_t.shape[2:],
+                                         device=patch_t.device)
                         for flip_axes in TTA_FLIP_AXES:
                             aug = (torch.flip(patch_t, flip_axes)
                                    if flip_axes else patch_t)
-                            prob = _forward(net, aug, use_4head, use_ensemble)
+                            prob_aug = _forward_single(net, aug, use_4head)
                             if flip_axes:
-                                prob = torch.flip(prob, flip_axes)
-                            acc += prob
-                        prob_final = (acc / len(TTA_FLIP_AXES)).cpu().numpy()
+                                prob_aug = torch.flip(prob_aug, flip_axes)
+                            acc += prob_aug
+                        # Average and take the foreground class probability
+                        prob_final = (acc / len(TTA_FLIP_AXES))[0, 0].cpu().numpy()
                     else:
-                        # Single forward pass (M0 – M4)
-                        prob_final = _forward(
-                            net, patch_t, use_4head,
-                            use_ensemble).cpu().numpy()
+                        prob = _forward_single(net, patch_t, use_4head)
+                        prob_final = prob[0, 0].cpu().numpy()  # (H, W, D)
 
                 score_map[:, xs:xs + patch_size[0],
                              ys:ys + patch_size[1],
@@ -230,7 +218,7 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size,
 
 def test_all_case(net, image_list, num_classes, patch_size,
                   stride_xy, stride_z,
-                  use_4head, use_tta, use_ensemble,
+                  use_4head,
                   save_result=True, test_save_path=None,
                   metric_detail=False, nms=False):
     """
@@ -249,10 +237,7 @@ def test_all_case(net, image_list, num_classes, patch_size,
 
         prediction, score_map = test_single_case(
             net, image, stride_xy, stride_z, patch_size,
-            num_classes=num_classes,
-            use_4head=use_4head,
-            use_tta=use_tta,
-            use_ensemble=use_ensemble)
+            num_classes=num_classes, use_4head=use_4head)
 
         if nms:
             prediction = getLargestCC(prediction)
@@ -291,13 +276,8 @@ def test_all_case(net, image_list, num_classes, patch_size,
 if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-    FLAGS      = VARIANT_FLAGS[args.variant]
-    use_4head   = FLAGS['use_4head']
-    use_tta     = FLAGS['use_tta']
-    use_ensemble = FLAGS['use_ensemble']
-
     # ---- Load model --------------------------------------------------------
-    if use_4head:
+    if USE_4HEAD:
         from networks.vnet_sdf import VNet
     else:
         from networks.vnet_base import VNet
@@ -308,7 +288,7 @@ if __name__ == '__main__':
     net.eval()
 
     print(f'Variant: {args.variant}  |  '
-          f'4-head={use_4head}  TTA={use_tta}  ensemble={use_ensemble}')
+          f'4-head={USE_4HEAD}  TTA={USE_TTA}  ensemble={USE_ENSEMBLE}')
     print(f'Loaded checkpoint: {args.model_path}')
 
     # ---- Test image list ---------------------------------------------------
@@ -332,9 +312,7 @@ if __name__ == '__main__':
         patch_size=tuple(args.patch_size),
         stride_xy=args.stride_xy,
         stride_z=args.stride_z,
-        use_4head=use_4head,
-        use_tta=use_tta,
-        use_ensemble=use_ensemble,
+        use_4head=USE_4HEAD,
         save_result=bool(args.save_result),
         test_save_path=save_path,
         metric_detail=True,
