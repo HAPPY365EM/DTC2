@@ -8,10 +8,6 @@ M1  + Extra heads         4-head VNet | uniform DTC MSE | boundary + aux loss | 
 M2  + Adaptive DTC loss   4-head VNet | adaptive DTC    | boundary + aux loss | no HD | no EMA
 M3  + HD loss             4-head VNet | adaptive DTC    | boundary+aux+HD     | no EMA
 M4  + EMA teacher         4-head VNet | adaptive DTC    | boundary+aux+HD     | EMA pseudo-label
-
-NOTE: M5 uses the same training checkpoint as M4.
-      The only difference is test-time augmentation (TTA) enabled in test_ablation.py.
-      Run M4 training, then test with --variant M5 to get M5 results.
 """
 
 import os
@@ -49,9 +45,6 @@ from dataloaders.la_heart import (
 # Variant configuration
 # =============================================================================
 
-# Each flag set precisely encodes which components are active.
-# This table is the single source of truth — the training loop
-# reads only from FLAGS, never from args.variant directly.
 VARIANT_FLAGS = {
     'M0': dict(use_4head=False, use_adaptive_dtc=False,
                use_hd=False,    use_ema=False),
@@ -63,7 +56,6 @@ VARIANT_FLAGS = {
                use_hd=True,     use_ema=False),
     'M4': dict(use_4head=True,  use_adaptive_dtc=True,
                use_hd=True,     use_ema=True),
-    # M5 = M4 training weights; TTA differs only at inference (test_ablation.py)
 }
 
 # =============================================================================
@@ -75,7 +67,7 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument('--variant', type=str, default='M4',
                     choices=list(VARIANT_FLAGS.keys()),
-                    help='Ablation variant (M0=baseline, M4=full minus TTA)')
+                    help='Ablation variant (M0=baseline, M4=full)')
 parser.add_argument('--root_path', type=str,
                     default='../data/2018LA_Seg_Training Set/')
 parser.add_argument('--exp', type=str, default='LA/Ablation')
