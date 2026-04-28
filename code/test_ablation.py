@@ -1,5 +1,5 @@
 """
-test_ablation.py — Unified test script for ablation variants M0 – M3.
+test_ablation.py — Unified test script for ablation variants M0 – M4.
 
 All variants are evaluated under the same inference protocol:
     - 4‑fold test‑time augmentation (TTA)
@@ -47,6 +47,7 @@ USE_4HEAD_MAP = {
     'M1': True,
     'M2': True,
     'M3': True,
+    'M4': True,
 }
 
 # =============================================================================
@@ -54,8 +55,8 @@ USE_4HEAD_MAP = {
 # =============================================================================
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--variant', type=str, default='M3',
-                    choices=['M0', 'M1', 'M2', 'M3'])
+parser.add_argument('--variant', type=str, default='M4',
+                    choices=['M0', 'M1', 'M2', 'M3', 'M4'])
 parser.add_argument('--model_path', type=str, required=True,
                     help='Path to saved model checkpoint (.pth)')
 parser.add_argument('--root_path', type=str,
