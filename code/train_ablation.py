@@ -1,13 +1,12 @@
 """
-train_ablation.py — Unified training script for ablation variants M0 – M4.
+train_ablation.py — Unified training script for ablation variants M0 – M3.
 
 Variant map
 -----------
-M0  DTC baseline          2-head VNet | uniform DTC MSE | no boundary/aux/HD | no EMA
-M1  + Extra heads         4-head VNet | uniform DTC MSE | boundary + aux loss | no HD | no EMA
-M2  + Adaptive DTC loss   4-head VNet | adaptive DTC    | boundary + aux loss | no HD | no EMA
-M3  + HD loss             4-head VNet | adaptive DTC    | boundary+aux+HD     | no EMA
-M4  + EMA teacher         4-head VNet | adaptive DTC    | boundary+aux+HD     | EMA pseudo-label
+M0  DTC baseline          2-head VNet | uniform DTC MSE | no boundary/aux/HD
+M1  + Extra heads         4-head VNet | uniform DTC MSE | boundary + aux loss | no HD
+M2  + Adaptive DTC loss   4-head VNet | adaptive DTC    | boundary + aux loss | no HD
+M3  + HD loss             4-head VNet | adaptive DTC    | boundary+aux+HD
 """
 
 import os
@@ -46,16 +45,10 @@ from dataloaders.la_heart import (
 # =============================================================================
 
 VARIANT_FLAGS = {
-    'M0': dict(use_4head=False, use_adaptive_dtc=False,
-               use_hd=False,    use_ema=False),
-    'M1': dict(use_4head=True,  use_adaptive_dtc=False,
-               use_hd=False,    use_ema=False),
-    'M2': dict(use_4head=True,  use_adaptive_dtc=True,
-               use_hd=False,    use_ema=False),
-    'M3': dict(use_4head=True,  use_adaptive_dtc=True,
-               use_hd=True,     use_ema=False),
-    'M4': dict(use_4head=True,  use_adaptive_dtc=True,
-               use_hd=True,     use_ema=True),
+    'M0': dict(use_4head=False, use_adaptive_dtc=False, use_hd=False),
+    'M1': dict(use_4head=True,  use_adaptive_dtc=False, use_hd=False),
+    'M2': dict(use_4head=True,  use_adaptive_dtc=True,  use_hd=False),
+    'M3': dict(use_4head=True,  use_adaptive_dtc=True,  use_hd=True),
 }
 
 # =============================================================================
@@ -65,9 +58,9 @@ VARIANT_FLAGS = {
 parser = argparse.ArgumentParser(
     description='Ablation training for improved DTC framework')
 
-parser.add_argument('--variant', type=str, default='M4',
+parser.add_argument('--variant', type=str, default='M3',
                     choices=list(VARIANT_FLAGS.keys()),
-                    help='Ablation variant (M0=baseline, M4=full)')
+                    help='Ablation variant (M0=baseline, M3=full)')
 parser.add_argument('--root_path', type=str,
                     default='../data/2018LA_Seg_Training Set/')
 parser.add_argument('--exp', type=str, default='LA/Ablation')
@@ -89,12 +82,9 @@ parser.add_argument('--boundary_weight', type=float, default=0.3,
 parser.add_argument('--adtc_gamma', type=float, default=0.5,
                     help='gamma: disagreement weighting sharpness in adaptive DTC')
 parser.add_argument('--hd_weight', type=float, default=0.1,
-                    help='Weight for HD loss (M3/M4 only)')
+                    help='Weight for HD loss (M3 only)')
 parser.add_argument('--aux_weight', type=float, default=0.2,
-                    help='Weight for auxiliary deep supervision loss (M1-M4)')
-parser.add_argument('--ema_decay', type=float, default=0.99)
-parser.add_argument('--ema_consistency_weight', type=float, default=0.5,
-                    help='Weight for EMA teacher consistency loss (M4 only)')
+                    help='Weight for auxiliary deep supervision loss (M1-M3)')
 
 args = parser.parse_args()
 
@@ -106,7 +96,6 @@ FLAGS = VARIANT_FLAGS[args.variant]
 USE_4HEAD        = FLAGS['use_4head']
 USE_ADAPTIVE_DTC = FLAGS['use_adaptive_dtc']
 USE_HD           = FLAGS['use_hd']
-USE_EMA          = FLAGS['use_ema']
 
 snapshot_path = (
     f"../model/{args.exp}_{args.variant}"
@@ -128,13 +117,6 @@ num_classes  = 2                 # binary; network n_classes = num_classes - 1 =
 def get_current_consistency_weight(epoch):
     return args.consistency * ramps.sigmoid_rampup(
         epoch, args.consistency_rampup)
-
-
-def update_ema_variables(model, ema_model, alpha, global_step):
-    """Exponential moving average: teacher ← α*teacher + (1-α)*student."""
-    alpha = min(1.0 - 1.0 / (global_step + 1), alpha)
-    for ema_p, p in zip(ema_model.parameters(), model.parameters()):
-        ema_p.data.mul_(alpha).add_(p.data, alpha=1.0 - alpha)
 
 
 # =============================================================================
@@ -174,22 +156,16 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Model creation
     # ------------------------------------------------------------------
-    def create_model(ema=False):
+    def create_model():
         if USE_4HEAD:
             from networks.vnet_sdf import VNet
         else:
             from networks.vnet_base import VNet          # 2-head for M0
         net = VNet(n_channels=1, n_classes=num_classes - 1,
                    normalization='batchnorm', has_dropout=True).cuda()
-        if ema:
-            for p in net.parameters():
-                p.detach_()
         return net
 
-    model = create_model(ema=False)
-
-    # EMA teacher only created for M4
-    ema_model = create_model(ema=True) if USE_EMA else None
+    model = create_model()
 
     # ------------------------------------------------------------------
     # Dataset / dataloader
@@ -233,8 +209,6 @@ if __name__ == '__main__':
     # Training loop
     # ------------------------------------------------------------------
     model.train()
-    if ema_model is not None:
-        ema_model.train()
 
     iter_num  = 0
     max_epoch = args.max_iterations // len(trainloader) + 1
@@ -276,14 +250,14 @@ if __name__ == '__main__':
                     outputs[:labeled_bs, 0].shape)
                 gt_dis = torch.from_numpy(gt_dis_np).float().cuda()
 
-                # Boundary GT — required by M1-M4
+                # Boundary GT — required by M1-M3
                 if USE_4HEAD:
                     gt_boundary_np = compute_boundary_gt(
                         label_batch[:labeled_bs].cpu().numpy())
                     gt_boundary = torch.from_numpy(
                         gt_boundary_np).float().cuda()
 
-                # Distance transform map — required by M3/M4 (HD loss)
+                # Distance transform map — required by M3 (HD loss)
                 if USE_HD:
                     gt_dtm_np = compute_dtm(
                         label_batch[:labeled_bs].cpu().numpy(),
@@ -305,7 +279,7 @@ if __name__ == '__main__':
                 outputs_soft[:labeled_bs, 0],
                 label_batch[:labeled_bs] == 1)
 
-            # --- Boundary head loss (M1-M4) ---
+            # --- Boundary head loss (M1-M3) ---
             if USE_4HEAD:
                 n_pos = gt_boundary.sum().clamp(min=1.0)
                 n_neg = (1.0 - gt_boundary).sum()
@@ -320,7 +294,7 @@ if __name__ == '__main__':
                     outputs_aux_soft[:labeled_bs, 0],
                     label_batch[:labeled_bs] == 1)
 
-            # --- Hausdorff distance loss (M3/M4) ---
+            # --- Hausdorff distance loss (M3 only) ---
             if USE_HD:
                 loss_hd = hd_loss(
                     outputs_soft[:labeled_bs, 0],
@@ -355,24 +329,7 @@ if __name__ == '__main__':
                     (dis_to_mask[:, 0] - outputs_soft[:, 0]) ** 2)
 
             # ==============================================================
-            # 5. EMA teacher pseudo-label consistency (M4 only)
-            # ==============================================================
-            if USE_EMA:
-                with torch.no_grad():
-                    if USE_4HEAD:
-                        ema_tanh, ema_out, _, _ = ema_model(
-                            volume_batch[labeled_bs:])
-                    else:
-                        ema_tanh, ema_out = ema_model(
-                            volume_batch[labeled_bs:])
-                    ema_soft   = torch.sigmoid(ema_out)
-                    ema_pseudo = (ema_soft[:, 0] > 0.5).float()
-
-                loss_ema_consistency = losses.dice_loss(
-                    outputs_soft[labeled_bs:, 0], ema_pseudo)
-
-            # ==============================================================
-            # 6. Supervised loss (variant-specific composition)
+            # 5. Supervised loss (variant-specific composition)
             # ==============================================================
             supervised_loss = (
                 0.5 * loss_seg
@@ -388,29 +345,19 @@ if __name__ == '__main__':
                 supervised_loss += args.hd_weight * loss_hd
 
             # ==============================================================
-            # 7. Total loss
+            # 6. Total loss
             # ==============================================================
             consistency_weight = get_current_consistency_weight(
                 iter_num // 150)
 
             loss = supervised_loss + consistency_weight * consistency_loss
-            if USE_EMA:
-                loss += (consistency_weight
-                         * args.ema_consistency_weight
-                         * loss_ema_consistency)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Update EMA teacher
-            if USE_EMA:
-                update_ema_variables(model, ema_model,
-                                     alpha=args.ema_decay,
-                                     global_step=iter_num)
-
             # ==============================================================
-            # 8. Logging
+            # 7. Logging
             # ==============================================================
             iter_num += 1
 
@@ -427,9 +374,6 @@ if __name__ == '__main__':
                 writer.add_scalar('loss/aux',      loss_aux,      iter_num)
             if USE_HD:
                 writer.add_scalar('loss/hd',       loss_hd,       iter_num)
-            if USE_EMA:
-                writer.add_scalar('loss/ema_cons', loss_ema_consistency,
-                                  iter_num)
 
             log_msg = (
                 f'iter {iter_num:5d} [{args.variant}] '
@@ -441,8 +385,6 @@ if __name__ == '__main__':
                             f'  aux={loss_aux.item():.4f}')
             if USE_HD:
                 log_msg += f'  hd={loss_hd.item():.4f}'
-            if USE_EMA:
-                log_msg += f'  ema={loss_ema_consistency.item():.4f}'
             log_msg += f'  w={consistency_weight:.4f}'
             logging.info(log_msg)
 
