@@ -27,8 +27,7 @@ from dataloaders.la_heart import (LAHeart, RandomCrop, CenterCrop,
                                    ToTensor, TwoStreamBatchSampler)
 from utils.util import compute_sdf
 from utils.losses import compute_boundary_gt, adaptive_dtc_loss
-from utils.losses_2 import hd_loss, compute_dtm
-
+from utils.losses_2 import distance_weighted_mse_loss, compute_dtm
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
                     default='../data/2018LA_Seg_Training Set/',
@@ -222,7 +221,7 @@ if __name__ == "__main__":
                 gt_boundary,
                 pos_weight=boundary_pos_weight)
 
-            loss_hd = hd_loss(
+            loss_dw_mse = distance_weighted_mse_loss(
                 outputs_soft[:labeled_bs, 0, ...],
                 label_batch[:labeled_bs],
                 gt_dtm=gt_dtm,
@@ -261,7 +260,7 @@ if __name__ == "__main__":
                 + loss_seg_dice
                 + args.beta       * loss_sdf
                 + 0.1             * loss_boundary
-                + args.hd_weight  * loss_hd
+                + args.dw_mse_weight * loss_dw_mse
                 + args.aux_weight * loss_aux
             )
 
@@ -292,7 +291,7 @@ if __name__ == "__main__":
             writer.add_scalar('loss/seg_dice', loss_seg_dice, iter_num)
             writer.add_scalar('loss/sdf', loss_sdf, iter_num)
             writer.add_scalar('loss/boundary', loss_boundary, iter_num)
-            writer.add_scalar('loss/hd', loss_hd, iter_num)
+            writer.add_scalar('loss/dw_mse', loss_dw_mse, iter_num)
             writer.add_scalar('loss/aux', loss_aux, iter_num)
             writer.add_scalar('loss/consistency_weight', consistency_weight,
                               iter_num)
@@ -302,11 +301,12 @@ if __name__ == "__main__":
 
             logging.info(
                 'iter %d : loss=%.4f  dice=%.4f  sdf=%.4f  bce=%.4f  '
-                'bnd=%.4f  hd=%.4f  aux=%.4f  dtc=%.4f  ema=%.4f  w=%.4f' % (
+                'bnd=%.4f  dw_mse=%.4f  aux=%.4f  dtc=%.4f  ema=%.4f  w=%.4f' % (
                     iter_num, loss.item(), loss_seg_dice.item(),
                     loss_sdf.item(), loss_seg.item(), loss_boundary.item(),
-                    loss_hd.item(), loss_aux.item(), consistency_loss.item(),
+                    loss_dw_mse.item(), loss_aux.item(), consistency_loss.item(),
                     loss_ema_consistency.item(), consistency_weight))
+
 
             if iter_num % 50 == 0:
                 img = volume_batch[0, 0:1, :, :, 20:61:10].permute(
