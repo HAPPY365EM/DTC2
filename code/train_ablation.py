@@ -3,10 +3,10 @@ train_ablation.py — Unified training script for ablation variants M0 – M3.
 
 Variant map
 -----------
-M0  DTC baseline          2-head VNet | uniform DTC MSE | no boundary/aux/HD
-M1  + Extra heads         4-head VNet | uniform DTC MSE | boundary + aux loss | no HD
-M2  + Adaptive DTC loss   4-head VNet | adaptive DTC    | boundary + aux loss | no HD
-M3  + HD loss             4-head VNet | adaptive DTC    | boundary+aux+HD
+M0  DTC baseline          2-head VNet | uniform DTC MSE | no boundary/aux/DW‑MSE
+M1  + Extra heads         4-head VNet | uniform DTC MSE | boundary + aux loss | no DW‑MSE
+M2  + Adaptive DTC loss   4-head VNet | adaptive DTC    | boundary + aux loss | no DW‑MSE
+M3  + DW‑MSE  4-head VNet | adaptive DTC    | boundary+aux+DW‑MSE
 """
 
 import os
@@ -33,7 +33,7 @@ from tqdm import tqdm
 # --- project imports ---------------------------------------------------------
 from utils import ramps, losses, metrics
 from utils.losses import compute_boundary_gt, adaptive_dtc_loss
-from utils.losses_2 import hd_loss, compute_dtm
+from utils.losses_2 import distance_weighted_mse_loss, compute_dtm
 from utils.util import compute_sdf
 from dataloaders.la_heart import (
     LAHeart, RandomCrop, CenterCrop, RandomRotFlip,
@@ -45,10 +45,10 @@ from dataloaders.la_heart import (
 # =============================================================================
 
 VARIANT_FLAGS = {
-    'M0': dict(use_4head=False, use_adaptive_dtc=False, use_hd=False),
-    'M1': dict(use_4head=True,  use_adaptive_dtc=False, use_hd=False),
-    'M2': dict(use_4head=True,  use_adaptive_dtc=True,  use_hd=False),
-    'M3': dict(use_4head=True,  use_adaptive_dtc=True,  use_hd=True),
+    'M0': dict(use_4head=False, use_adaptive_dtc=False, use_dw_mse=False),
+    'M1': dict(use_4head=True,  use_adaptive_dtc=False, use_dw_mse=False),
+    'M2': dict(use_4head=True,  use_adaptive_dtc=True,  use_dw_mse=False),
+    'M3': dict(use_4head=True,  use_adaptive_dtc=True,  use_dw_mse=True),
 }
 
 # =============================================================================
@@ -81,8 +81,8 @@ parser.add_argument('--boundary_weight', type=float, default=0.3,
                     help='alpha: boundary spatial emphasis in adaptive DTC')
 parser.add_argument('--adtc_gamma', type=float, default=0.5,
                     help='gamma: disagreement weighting sharpness in adaptive DTC')
-parser.add_argument('--hd_weight', type=float, default=0.1,
-                    help='Weight for HD loss (M3 only)')
+parser.add_argument('--dw_mse_weight', type=float, default=0.1,
+                    help='Weight for distance-weighted MSE loss (M3 only)')
 parser.add_argument('--aux_weight', type=float, default=0.2,
                     help='Weight for auxiliary deep supervision loss (M1-M3)')
 
@@ -95,7 +95,7 @@ args = parser.parse_args()
 FLAGS = VARIANT_FLAGS[args.variant]
 USE_4HEAD        = FLAGS['use_4head']
 USE_ADAPTIVE_DTC = FLAGS['use_adaptive_dtc']
-USE_HD           = FLAGS['use_hd']
+USE_DW_MSE       = FLAGS['use_dw_mse']
 
 snapshot_path = (
     f"../model/{args.exp}_{args.variant}"
@@ -258,7 +258,7 @@ if __name__ == '__main__':
                         gt_boundary_np).float().cuda()
 
                 # Distance transform map — required by M3 (HD loss)
-                if USE_HD:
+                if USE_DW_MSE:
                     gt_dtm_np = compute_dtm(
                         label_batch[:labeled_bs].cpu().numpy(),
                         outputs[:labeled_bs, 0].shape,
@@ -294,9 +294,9 @@ if __name__ == '__main__':
                     outputs_aux_soft[:labeled_bs, 0],
                     label_batch[:labeled_bs] == 1)
 
-            # --- Hausdorff distance loss (M3 only) ---
-            if USE_HD:
-                loss_hd = hd_loss(
+            # --- Distance-weighted MSE loss (M3) ---
+            if USE_DW_MSE:
+                loss_dw_mse = distance_weighted_mse_loss(
                     outputs_soft[:labeled_bs, 0],
                     label_batch[:labeled_bs],
                     gt_dtm=gt_dtm,
@@ -341,8 +341,8 @@ if __name__ == '__main__':
                     0.1             * loss_boundary
                     + args.aux_weight * loss_aux
                 )
-            if USE_HD:
-                supervised_loss += args.hd_weight * loss_hd
+            if USE_DW_MSE:
+                supervised_loss += args.dw_mse_weight * loss_dw_mse
 
             # ==============================================================
             # 6. Total loss
@@ -372,8 +372,8 @@ if __name__ == '__main__':
             if USE_4HEAD:
                 writer.add_scalar('loss/boundary', loss_boundary, iter_num)
                 writer.add_scalar('loss/aux',      loss_aux,      iter_num)
-            if USE_HD:
-                writer.add_scalar('loss/hd',       loss_hd,       iter_num)
+            if USE_DW_MSE:
+                writer.add_scalar('loss/dw_mse',   loss_dw_mse,   iter_num)
 
             log_msg = (
                 f'iter {iter_num:5d} [{args.variant}] '
@@ -383,8 +383,8 @@ if __name__ == '__main__':
             if USE_4HEAD:
                 log_msg += (f'  bnd={loss_boundary.item():.4f}'
                             f'  aux={loss_aux.item():.4f}')
-            if USE_HD:
-                log_msg += f'  hd={loss_hd.item():.4f}'
+            if USE_DW_MSE:
+                log_msg += f'  dw_mse={loss_dw_mse.item():.4f}'
             log_msg += f'  w={consistency_weight:.4f}'
             logging.info(log_msg)
 
