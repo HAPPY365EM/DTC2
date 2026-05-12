@@ -1,5 +1,5 @@
-import torch
-from torch.nn import functional as F
+# import torch
+# from torch.nn import functional as F
 import numpy as np
 from scipy.ndimage import distance_transform_edt as distance
 from skimage import segmentation as skimage_seg
@@ -40,25 +40,24 @@ def compute_dtm(img_gt, out_shape, normalize=False, fg=False):
 
     return fg_dtm
 
-def hd_loss(seg_soft, gt, gt_dtm=None, one_side=True, seg_dtm=None):
+def distance_weighted_mse_loss(seg_soft, gt, gt_dtm=None, one_side=True, seg_dtm=None):
     """
-    compute huasdorff distance loss for binary segmentation
-    input: seg_soft: softmax results,  shape=(b,x,y,z)
-           gt: ground truth, shape=(b,x,y,z)
-           seg_dtm: segmentation distance transform map; shape=(b,x,y,z)
-           gt_dtm: ground truth distance transform map; shape=(b,x,y,z)
-    output: boundary_loss; sclar
+    Compute distance-weighted MSE loss for binary segmentation.
+    
+    This loss weights the squared prediction error by the squared distance
+    transform map of the ground truth. Voxels near the boundary receive lower
+    weight (boundary error is down-weighted), while interior/exterior voxels
+    receive higher weight, thereby reinforcing internal prediction consistency
+    and indirectly improving boundary metrics (ASD, 95HD).
     """
 
     delta_s = (seg_soft - gt.float()) ** 2
     g_dtm = gt_dtm ** 2
     dtm = g_dtm if one_side else g_dtm + seg_dtm ** 2
     multipled = torch.einsum('bxyz, bxyz->bxyz', delta_s, dtm)
-    # hd_loss = multipled.sum()*1.0/(gt_dtm > 0).sum()
-    hd_loss = multipled.mean()
-
-    return hd_loss
-
+    # Option A (area-normalized): dw_mse_loss = multipled.sum() / (gt_dtm > 0).sum()
+    dw_mse_loss = multipled.mean()
+    return dw_mse_loss
 
 
 def save_sdf(gt_path=None):
